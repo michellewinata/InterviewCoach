@@ -1087,6 +1087,7 @@ let currentQuestion = '';
 let mediaRecorder = null;
 let audioChunks = [];
 let asrPipeline = null;
+let asrPipelineLang = null;
 let audioContextLive = null;
 let micSource = null;
 let audioProcessor = null;
@@ -1094,7 +1095,7 @@ let liveSamples = [];
 let transcriptionQueue = Promise.resolve();
 let isFinalizing = false;
 let liveTranscriptParts = [];
-const LIVE_CHUNK_SECONDS = 4;
+const LIVE_CHUNK_SECONDS = 8;
 let recordingBlob = null;
 let sessionStartTime = null;
 let sessionTimerInterval = null;
@@ -1265,14 +1266,22 @@ function setStatus(state, meta = '') {
 //  SESSION CONTROL
 // ═══════════════════════════════════════════════════
 async function loadLocalASR() {
-  if (asrPipeline) return;
+  // Recreate the pipeline when the UI language changes; otherwise the English-only
+  // pipeline can accidentally be reused for Indonesian transcription.
+  if (asrPipeline && asrPipelineLang === currentLang) return;
+  asrPipeline = null;
+  asrPipelineLang = null;
   setStatus('analyzing', 'Loading open-source ASR model…');
   const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2');
   env.allowLocalModels = false;
   env.useBrowserCache = true;
-  asrPipeline = await pipeline('automatic-speech-recognition',
-    currentLang === 'en' ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-small',
-    { dtype: 'q8' });
+  const langForModel = currentLang;
+  const model = langForModel === 'en'
+    ? 'onnx-community/whisper-base.en'
+    : 'onnx-community/whisper-small';
+  const loadedPipeline = await pipeline('automatic-speech-recognition', model, { dtype: 'q8' });
+  asrPipeline = loadedPipeline;
+  asrPipelineLang = langForModel;
 }
 
 function resampleAudio(input, fromRate, toRate = 16000) {
@@ -1306,13 +1315,14 @@ function enqueueAudioChunk(samples, sampleRate) {
   if (!samples || !samples.length) return;
   const copy = new Float32Array(samples);
   transcriptionQueue = transcriptionQueue.then(async () => {
-    if (!asrPipeline) await loadLocalASR();
+    if (!asrPipeline || asrPipelineLang !== currentLang) await loadLocalASR();
+    const chunkLang = asrPipelineLang;
     const audio16k = resampleAudio(copy, sampleRate, 16000);
     if (!audio16k.length) return;
     setStatus('recording', 'Transcribing locally…');
     // English-only Whisper models reject explicit `task` and `language`.
     // Multilingual models (Indonesian) accept those generation options.
-    const decodeOptions = currentLang === 'en'
+    const decodeOptions = chunkLang === 'en'
       ? { sampling_rate: 16000 }
       : { sampling_rate: 16000, language: 'indonesian', task: 'transcribe' };
     const result = await asrPipeline(audio16k, decodeOptions);
