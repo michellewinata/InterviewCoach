@@ -1310,11 +1310,12 @@ function enqueueAudioChunk(samples, sampleRate) {
     const audio16k = resampleAudio(copy, sampleRate, 16000);
     if (!audio16k.length) return;
     setStatus('recording', 'Transcribing locally…');
-    const result = await asrPipeline(audio16k, {
-      sampling_rate: 16000,
-      language: currentLang === 'en' ? 'english' : 'indonesian',
-      task: 'transcribe'
-    });
+    // English-only Whisper models reject explicit `task` and `language`.
+    // Multilingual models (Indonesian) accept those generation options.
+    const decodeOptions = currentLang === 'en'
+      ? { sampling_rate: 16000 }
+      : { sampling_rate: 16000, language: 'indonesian', task: 'transcribe' };
+    const result = await asrPipeline(audio16k, decodeOptions);
     const part = (result.text || '').trim();
     if (part) {
       // Remove exact repeated text at chunk boundaries, which Whisper can sometimes emit.
