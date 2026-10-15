@@ -26,7 +26,7 @@ HTML = r"""
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="InterviewCoach - Practice interviews with real-time speech recognition, live transcription, filler word detection and performance reports." />
+<meta name="description" content="InterviewCoach - Practice interviews with local open-source Whisper transcription, filler word detection and performance reports." />
 <title>InterviewCoach</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -682,8 +682,7 @@ html, body {
 <div class="browser-warning" id="browser-warning">
   <span class="bw-icon">⚠️</span>
   <strong>Browser Not Supported</strong><br/>
-  InterviewCoach requires the <strong>Web Speech API</strong>.<br/>
-  Please use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong>.
+  This browser cannot record audio. Please use a modern browser with microphone support.
 </div>
 
 <!-- ════════════════════════════════════════════════
@@ -1047,7 +1046,7 @@ const LABELS = {
     noKeywords: "No keywords found.",
     noPauses: "No significant pauses detected.",
     fillerSummary: (n,w) => `${n} filler word${n!==1?'s':''} detected (${w}% of total words)`,
-    pauseSummary: (n) => `${n} pause${n!==1?'s':''} detected (>1.5 seconds)`,
+    pauseSummary: (n) => n ? `${n} pause${n!==1?'s':''} detected` : 'Pause detection is unavailable in batch transcription.',
   },
   id: {
     practiceMode: "Mode Latihan",
@@ -1075,7 +1074,7 @@ const LABELS = {
     noKeywords: "Tidak ada kata kunci ditemukan.",
     noPauses: "Tidak ada jeda signifikan terdeteksi.",
     fillerSummary: (n,w) => `${n} kata filler terdeteksi (${w}% dari total kata)`,
-    pauseSummary: (n) => `${n} jeda terdeteksi (>1,5 detik)`,
+    pauseSummary: (n) => n ? `${n} jeda terdeteksi` : 'Deteksi jeda tidak tersedia pada transkripsi batch.',
   }
 };
 
@@ -1085,7 +1084,18 @@ const LABELS = {
 let currentLang = 'en';
 let currentMode = 'free';
 let currentQuestion = '';
-let recognition = null;
+let mediaRecorder = null;
+let audioChunks = [];
+let asrPipeline = null;
+let audioContextLive = null;
+let micSource = null;
+let audioProcessor = null;
+let liveSamples = [];
+let transcriptionQueue = Promise.resolve();
+let isFinalizing = false;
+let liveTranscriptParts = [];
+const LIVE_CHUNK_SECONDS = 4;
+let recordingBlob = null;
 let sessionStartTime = null;
 let sessionTimerInterval = null;
 let finalTranscript = '';
@@ -1099,26 +1109,11 @@ let sessionActive = false;
 // ═══════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════
-function init() {
-  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRec) {
-    document.getElementById('browser-warning').style.display = 'block';
-    document.getElementById('app-main').style.display = 'none';
-    return;
-  }
-  recognition = new SpeechRec();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = 'en-US';
-
-  recognition.onstart = onRecognitionStart;
-  recognition.onresult = onRecognitionResult;
-  recognition.onerror = onRecognitionError;
-  recognition.onend = onRecognitionEnd;
-
+async function init() {
   populateQuestions();
   applyLabels();
   updateUI();
+  setStatus('idle', 'Local Whisper model loads when recording is stopped');
 }
 
 // ═══════════════════════════════════════════════════
@@ -1128,7 +1123,7 @@ function setLang(lang) {
   currentLang = lang;
   document.getElementById('lang-en').classList.toggle('active', lang === 'en');
   document.getElementById('lang-id').classList.toggle('active', lang === 'id');
-  if (recognition) recognition.lang = lang === 'en' ? 'en-US' : 'id-ID';
+
   populateQuestions();
   applyLabels();
   // Reset question display
@@ -1269,64 +1264,177 @@ function setStatus(state, meta = '') {
 // ═══════════════════════════════════════════════════
 //  SESSION CONTROL
 // ═══════════════════════════════════════════════════
-function startSession() {
-  finalTranscript = '';
-  pauses = [];
-  lastResultTime = null;
-  wordCount = 0;
-  fillerCountLive = 0;
+async function loadLocalASR() {
+  if (asrPipeline) return;
+  setStatus('analyzing', 'Loading open-source ASR model…');
+  const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2');
+  env.allowLocalModels = false;
+  env.useBrowserCache = true;
+  asrPipeline = await pipeline('automatic-speech-recognition',
+    currentLang === 'en' ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-small',
+    { dtype: 'q8' });
+}
 
+function resampleAudio(input, fromRate, toRate = 16000) {
+  if (fromRate === toRate) return input;
+  const ratio = fromRate / toRate;
+  const outputLength = Math.floor(input.length / ratio);
+  const output = new Float32Array(outputLength);
+  for (let i = 0; i < outputLength; i++) {
+    const pos = i * ratio;
+    const left = Math.floor(pos);
+    const right = Math.min(left + 1, input.length - 1);
+    const frac = pos - left;
+    output[i] = input[left] * (1 - frac) + input[right] * frac;
+  }
+  return output;
+}
+
+function updateLiveTranscript() {
+  const text = liveTranscriptParts.join(' ').replace(/\s+/g, ' ').trim();
+  finalTranscript = text;
+  document.getElementById('final-text').textContent = text;
+  document.getElementById('interim-text').textContent = '';
+  document.getElementById('transcript-placeholder').style.display = text ? 'none' : 'flex';
+  const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+  const elapsed = sessionStartTime ? Math.max((Date.now() - sessionStartTime) / 1000, 1) : 1;
+  fillerCountLive = countFillers(text);
+  updateLiveMetrics(Math.round(words / elapsed * 60), words, fillerCountLive);
+}
+
+function enqueueAudioChunk(samples, sampleRate) {
+  if (!samples || !samples.length) return;
+  const copy = new Float32Array(samples);
+  transcriptionQueue = transcriptionQueue.then(async () => {
+    if (!asrPipeline) await loadLocalASR();
+    const audio16k = resampleAudio(copy, sampleRate, 16000);
+    if (!audio16k.length) return;
+    setStatus('recording', 'Transcribing locally…');
+    const result = await asrPipeline(audio16k, {
+      sampling_rate: 16000,
+      language: currentLang === 'en' ? 'english' : 'indonesian',
+      task: 'transcribe'
+    });
+    const part = (result.text || '').trim();
+    if (part) {
+      // Remove exact repeated text at chunk boundaries, which Whisper can sometimes emit.
+      const previous = liveTranscriptParts.length ? liveTranscriptParts[liveTranscriptParts.length - 1] : '';
+      if (part !== previous) liveTranscriptParts.push(part);
+      updateLiveTranscript();
+    }
+    if (sessionActive) setStatus('recording', 'Local transcription active');
+  }).catch(e => {
+    console.error('Local streaming transcription failed:', e);
+    setStatus('idle', 'Local transcription failed; check model download and browser console.');
+  });
+}
+
+async function startSession() {
+  finalTranscript = ''; pauses = []; lastResultTime = null; wordCount = 0; fillerCountLive = 0;
+  audioChunks = []; recordingBlob = null; liveSamples = []; liveTranscriptParts = [];
+  transcriptionQueue = Promise.resolve(); isFinalizing = false;
   document.getElementById('final-text').textContent = '';
   document.getElementById('interim-text').textContent = '';
   document.getElementById('transcript-placeholder').style.display = 'flex';
   document.getElementById('report-section').classList.remove('visible');
-
   updateLiveMetrics(0, 0, 0);
   document.getElementById('live-duration').textContent = '0:00';
-
-  sessionStartTime = Date.now();
-  sessionActive = true;
-
-  sessionTimerInterval = setInterval(() => {
-    const elapsed = (Date.now() - sessionStartTime) / 1000;
-    document.getElementById('live-duration').textContent = formatTime(elapsed);
-    // Strip pause markers before counting words
-    const cleanT = finalTranscript.replace(/\s*\/+\s*/g, ' ');
-    const words = cleanT.split(/\s+/).filter(Boolean).length;
-    const wpm = elapsed > 3 ? Math.round((words / elapsed) * 60) : 0;
-    document.getElementById('live-wpm').textContent = wpm || '—';
-    document.getElementById('live-words').textContent = words;
-    document.getElementById('live-fillers').textContent = fillerCountLive;
-  }, 500);
-
-  setStatus('listening');
-  document.getElementById('btn-start').disabled = true;
-  document.getElementById('btn-stop').disabled = false;
-
-  try { recognition.start(); }
-  catch(e) { console.warn('Recognition already started.', e); }
+  try {
+    // Load model before recording so first-use download does not lose the opening words.
+    await loadLocalASR();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true
+    }});
+    audioContextLive = new (window.AudioContext || window.webkitAudioContext)();
+    await audioContextLive.resume();
+    micSource = audioContextLive.createMediaStreamSource(stream);
+    // ScriptProcessor provides PCM frames; Whisper runs locally on rolling 4-second windows.
+    audioProcessor = audioContextLive.createScriptProcessor(4096, 1, 1);
+    let chunkBuffer = [];
+    let chunkSamples = 0;
+    const targetSamples = Math.round(audioContextLive.sampleRate * LIVE_CHUNK_SECONDS);
+    audioProcessor.onaudioprocess = e => {
+      if (!sessionActive) return;
+      const frame = e.inputBuffer.getChannelData(0);
+      const frameCopy = new Float32Array(frame);
+      chunkBuffer.push(frameCopy);
+      chunkSamples += frameCopy.length;
+      if (chunkSamples >= targetSamples) {
+        const joined = new Float32Array(chunkSamples);
+        let offset = 0;
+        for (const piece of chunkBuffer) { joined.set(piece, offset); offset += piece.length; }
+        enqueueAudioChunk(joined, audioContextLive.sampleRate);
+        chunkBuffer = []; chunkSamples = 0;
+      }
+    };
+    // Keep a reference so Stop can flush the remaining samples.
+    audioProcessor._getPendingAudio = () => {
+      if (!chunkSamples) return null;
+      const joined = new Float32Array(chunkSamples);
+      let offset = 0;
+      for (const piece of chunkBuffer) { joined.set(piece, offset); offset += piece.length; }
+      chunkBuffer = []; chunkSamples = 0;
+      return joined;
+    };
+    micSource.connect(audioProcessor);
+    audioProcessor.connect(audioContextLive.destination);
+    // Mute the processor output to avoid microphone feedback while keeping the graph active.
+    const mute = audioContextLive.createGain(); mute.gain.value = 0;
+    audioProcessor.disconnect(); audioProcessor.connect(mute); mute.connect(audioContextLive.destination);
+    audioProcessor._muteNode = mute;
+    sessionStartTime = Date.now(); sessionActive = true;
+    sessionTimerInterval = setInterval(() => {
+      document.getElementById('live-duration').textContent = formatTime((Date.now()-sessionStartTime)/1000);
+    }, 500);
+    setStatus('recording', 'Local transcription active · updates every few seconds');
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    // Save stream so it can be stopped cleanly.
+    audioProcessor._stream = stream;
+  } catch (e) {
+    console.error(e); sessionActive = false;
+    if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
+    if (audioContextLive) { try { await audioContextLive.close(); } catch(_) {} }
+    setStatus('idle', 'Microphone permission/model download is required');
+    alert('Please allow microphone access and ensure the open-source model can be downloaded, then try again.');
+  }
 }
 
-function stopSession() {
-  sessionActive = false;
-  clearInterval(sessionTimerInterval);
-  recognition.stop();
-  setStatus('analyzing');
-  document.getElementById('btn-start').disabled = false;
-  document.getElementById('btn-stop').disabled = true;
-  setTimeout(buildReport, 500);
+async function stopSession() {
+  if (!sessionActive && !audioContextLive) return;
+  sessionActive = false; clearInterval(sessionTimerInterval);
+  try {
+    if (audioProcessor && audioProcessor._getPendingAudio) {
+      const pending = audioProcessor._getPendingAudio();
+      if (pending && pending.length) enqueueAudioChunk(pending, audioContextLive.sampleRate);
+    }
+    if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
+    if (micSource) { try { micSource.disconnect(); } catch(_) {} }
+    if (audioProcessor && audioProcessor._muteNode) { try { audioProcessor._muteNode.disconnect(); } catch(_) {} }
+    if (audioProcessor && audioProcessor._stream) audioProcessor._stream.getTracks().forEach(track => track.stop());
+    setStatus('analyzing', 'Finishing local transcription…');
+    await transcriptionQueue;
+    if (audioContextLive) { try { await audioContextLive.close(); } catch(_) {} }
+    audioContextLive = null; micSource = null; audioProcessor = null;
+    updateLiveTranscript();
+    const duration = sessionStartTime ? (Date.now()-sessionStartTime)/1000 : 0;
+    document.getElementById('live-duration').textContent = formatTime(duration);
+    buildReport();
+  } finally {
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-stop').disabled = true;
+  }
 }
 
 function resetSession() {
-  sessionActive = false;
-  clearInterval(sessionTimerInterval);
-  try { recognition.stop(); } catch(e) {}
-  finalTranscript = '';
-  pauses = [];
-  wordCount = 0;
-  fillerCountLive = 0;
-  lastResultTime = null;
-
+  sessionActive = false; clearInterval(sessionTimerInterval);
+  if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
+  if (micSource) { try { micSource.disconnect(); } catch(_) {} }
+  if (audioProcessor && audioProcessor._stream) audioProcessor._stream.getTracks().forEach(track => track.stop());
+  if (audioContextLive) { try { audioContextLive.close(); } catch(_) {} }
+  audioContextLive = null; micSource = null; audioProcessor = null;
+  audioChunks = []; liveSamples = []; liveTranscriptParts = []; transcriptionQueue = Promise.resolve();
+  finalTranscript = ''; pauses = []; wordCount = 0; fillerCountLive = 0; lastResultTime = null;
   document.getElementById('final-text').textContent = '';
   document.getElementById('interim-text').textContent = '';
   document.getElementById('transcript-placeholder').style.display = 'flex';
@@ -1339,78 +1447,7 @@ function resetSession() {
   document.getElementById('btn-stop').disabled = true;
   setStatus('idle');
 }
-
-function updateUI() {
-  document.getElementById('btn-stop').disabled = true;
-}
-
-// ═══════════════════════════════════════════════════
-//  SPEECH RECOGNITION CALLBACKS
-// ═══════════════════════════════════════════════════
-function onRecognitionStart() {
-  setStatus('recording');
-}
-
-function onRecognitionResult(event) {
-  const now = Date.now();
-
-  // Pause detection: gap from last result > 1500ms
-  if (lastResultTime && (now - lastResultTime) > 1500) {
-    const gap = (now - lastResultTime) / 1000;
-    pauses.push({ duration: Math.round(gap * 10) / 10, time: formatTime((lastResultTime - sessionStartTime) / 1000) });
-    // Insert pause marker inline into transcript (// = long >3s, / = short)
-    finalTranscript += gap > 3 ? ' // ' : ' / ';
-  }
-  lastResultTime = now;
-
-  let interimText = '';
-  for (let i = event.resultIndex; i < event.results.length; i++) {
-    const piece = event.results[i][0].transcript;
-    if (event.results[i].isFinal) {
-      finalTranscript += piece + ' ';
-    } else {
-      interimText += piece;
-    }
-  }
-
-  // Show/hide placeholder
-  if (finalTranscript || interimText) {
-    document.getElementById('transcript-placeholder').style.display = 'none';
-  }
-
-  document.getElementById('final-text').textContent = finalTranscript;
-  document.getElementById('interim-text').textContent = interimText;
-
-  // Scroll to bottom
-  const area = document.getElementById('transcript-area');
-  area.scrollTop = area.scrollHeight;
-
-  // Count fillers live (exclude pause markers from text before counting)
-  const cleanForFillers = finalTranscript.replace(/\s*\/+\s*/g, ' ');
-  fillerCountLive = countFillers(cleanForFillers + ' ' + interimText);
-  document.getElementById('live-fillers').textContent = fillerCountLive;
-}
-
-function onRecognitionError(event) {
-  console.error('Speech recognition error:', event.error);
-  if (event.error === 'no-speech') return; // Non-fatal
-  if (event.error === 'not-allowed') {
-    setStatus('idle', 'Microphone access denied');
-    resetSession();
-    return;
-  }
-  // Auto-restart for network/audio errors if session is still active
-  if (sessionActive) {
-    setTimeout(() => { try { recognition.start(); } catch(e){} }, 500);
-  }
-}
-
-function onRecognitionEnd() {
-  // Auto-restart if session is still active (handles Chrome's timeout)
-  if (sessionActive) {
-    try { recognition.start(); } catch(e) {}
-  }
-}
+function updateUI() { document.getElementById('btn-stop').disabled = true; }
 
 // ═══════════════════════════════════════════════════
 //  ANALYSIS ENGINE
@@ -1493,7 +1530,7 @@ function buildReport() {
     { icon: '💬', val: totalWords, lbl: currentLang==='en'?'Total Words':'Total Kata', sub: '' },
     { icon: '📈', val: wpm, lbl: currentLang==='en'?'Avg WPM':'Rata-rata KPM', sub: currentLang==='en'?'Words per minute':'Kata per menit' },
     { icon: '🔴', val: totalFillers, lbl: currentLang==='en'?'Filler Words':'Kata Filler', sub: `${fillerPct}% of words` },
-    { icon: '⏸️', val: pauses.length, lbl: currentLang==='en'?'Pauses':'Jeda', sub: currentLang==='en'?'>1.5s gaps':'>1,5s jeda' },
+    { icon: '⏸️', val: pauses.length, lbl: currentLang==='en'?'Pauses':'Jeda', sub: currentLang==='en'?'Not estimated in batch mode':'Tidak diestimasi pada mode batch' },
     { icon: '🔑', val: keywords.length, lbl: currentLang==='en'?'Key Topics':'Topik Kunci', sub: '' },
   ];
   statsGrid.innerHTML = stats.map(s => `
