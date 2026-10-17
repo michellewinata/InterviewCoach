@@ -682,7 +682,7 @@ html, body {
 <div class="browser-warning" id="browser-warning">
   <span class="bw-icon">⚠️</span>
   <strong>Browser Not Supported</strong><br/>
-  This browser cannot record audio. Please use a modern browser with microphone support.
+  This browser cannot record audio (needs microphone access). Please use a recent Chrome, Edge or Firefox and open the app via <strong>localhost</strong> or HTTPS.
 </div>
 
 <!-- ════════════════════════════════════════════════
@@ -1035,7 +1035,7 @@ const LABELS = {
     topKeywords: "Top Keywords",
     pauses: "Detected Pauses",
     finalTranscript: "Final Transcript",
-    legendFiller: "filler", legendHighlighted: " = highlighted",
+    legendFiller: "filler", legendHighlighted: " = highlighted · / pause 1.5–3s · // pause >3s",
     roll: "Roll a Question",
     statusReady: "Ready to start",
     statusListening: "Listening…",
@@ -1046,7 +1046,9 @@ const LABELS = {
     noKeywords: "No keywords found.",
     noPauses: "No significant pauses detected.",
     fillerSummary: (n,w) => `${n} filler word${n!==1?'s':''} detected (${w}% of total words)`,
-    pauseSummary: (n) => n ? `${n} pause${n!==1?'s':''} detected` : 'Pause detection is unavailable in batch transcription.',
+    pauseSummary: (n, total, longest) => n
+      ? `${n} pause${n!==1?'s':''} detected (>1.5s) · total ${total}s · longest ${longest}s`
+      : '0 pauses detected (>1.5s)',
   },
   id: {
     practiceMode: "Mode Latihan",
@@ -1063,7 +1065,7 @@ const LABELS = {
     topKeywords: "Kata Kunci Utama",
     pauses: "Jeda Terdeteksi",
     finalTranscript: "Transkrip Akhir",
-    legendFiller: "filler", legendHighlighted: " = disorot",
+    legendFiller: "filler", legendHighlighted: " = disorot · / jeda 1,5–3s · // jeda >3s",
     roll: "Pilihkan Pertanyaan",
     statusReady: "Siap untuk memulai",
     statusListening: "Mendengarkan…",
@@ -1074,7 +1076,9 @@ const LABELS = {
     noKeywords: "Tidak ada kata kunci ditemukan.",
     noPauses: "Tidak ada jeda signifikan terdeteksi.",
     fillerSummary: (n,w) => `${n} kata filler terdeteksi (${w}% dari total kata)`,
-    pauseSummary: (n) => n ? `${n} jeda terdeteksi` : 'Deteksi jeda tidak tersedia pada transkripsi batch.',
+    pauseSummary: (n, total, longest) => n
+      ? `${n} jeda terdeteksi (>1,5s) · total ${total}s · terlama ${longest}s`
+      : '0 jeda terdeteksi (>1,5s)',
   }
 };
 
@@ -1084,42 +1088,36 @@ const LABELS = {
 let currentLang = 'en';
 let currentMode = 'free';
 let currentQuestion = '';
-let mediaRecorder = null;
-let audioChunks = [];
-let asrPipeline = null;
-let audioContextLive = null;
-let micSource = null;
-let audioProcessor = null;
-let liveSamples = [];
-let transcriptionQueue = Promise.resolve();
-let isFinalizing = false;
-let liveTranscriptParts = [];
-const LIVE_CHUNK_SECONDS = 4;
-let recordingBlob = null;
 let sessionStartTime = null;
 let sessionTimerInterval = null;
-let finalTranscript = '';
-let pauseTimestamps = [];      // [{start, end, duration}]
-let lastResultTime = null;
-let wordCount = 0;
+let finalTranscript = '';       // text with pause markers: ' / ' (1.5–3s) and ' // ' (>3s)
 let fillerCountLive = 0;
-let pauses = [];
+let pauses = [];                // [{time:'m:ss', duration:s}] measured from the audio
+let sessionDuration = 0;        // seconds of audio recorded
+let articulationTime = 0;       // seconds of actual talking (pauses removed)
 let sessionActive = false;
 
 // ═══════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════
 async function init() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    document.getElementById('browser-warning').style.display = 'block';
+    document.getElementById('app-main').style.display = 'none';
+    return;
+  }
   populateQuestions();
   applyLabels();
   updateUI();
-  setStatus('idle', 'Local Whisper model loads when recording is stopped');
+  warmupAsr();   // download + warm up the local Whisper model now, so Start is instant
 }
 
 // ═══════════════════════════════════════════════════
 //  LANGUAGE
 // ═══════════════════════════════════════════════════
 function setLang(lang) {
+  if (lang === currentLang) return;
+  if (sessionActive) resetSession();
   currentLang = lang;
   document.getElementById('lang-en').classList.toggle('active', lang === 'en');
   document.getElementById('lang-id').classList.toggle('active', lang === 'id');
@@ -1132,6 +1130,7 @@ function setLang(lang) {
   document.getElementById('q-display').classList.add('empty');
   document.getElementById('random-display').textContent = L('modeRandomSub');
   updateQuestionDisplay();
+  warmupAsr();
 }
 
 function L(key) { return LABELS[currentLang][key] || LABELS.en[key] || key; }
@@ -1262,181 +1261,647 @@ function setStatus(state, meta = '') {
 }
 
 // ═══════════════════════════════════════════════════
-//  SESSION CONTROL
+//  SESSION CONTROL + LOCAL ASR (open-source Whisper, runs on this device)
 // ═══════════════════════════════════════════════════
-async function loadLocalASR() {
-  if (asrPipeline) return;
-  setStatus('analyzing', 'Loading open-source ASR model…');
-  const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2');
-  env.allowLocalModels = false;
-  env.useBrowserCache = true;
-  asrPipeline = await pipeline('automatic-speech-recognition',
-    currentLang === 'en' ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-small',
-    { dtype: 'q8' });
+// ═══════════════════════════════════════════════════
+//  LOCAL SPEECH ENGINE — CORE (pure logic, no DOM)
+//  1. StreamResampler : mic rate → 16 kHz (box filter, no drift between chunks)
+//  2. Segmenter       : adaptive-energy VAD → cuts audio at natural pauses,
+//                       measures every pause from the REAL audio timeline
+//  3. cleanAsrText    : removes Whisper hallucinations / repetition loops
+// ═══════════════════════════════════════════════════
+const ASR_SR = 16000;
+const FRAME = 320;                    // 20 ms @ 16 kHz
+const FRAME_SEC = FRAME / ASR_SR;
+const MIN_RUN_FRAMES = 5;             // 100 ms continuous energy = real speech (ignores clicks)
+const HANGOVER_SEC = 0.35;            // short dips inside a word/phrase are still "speaking"
+const SILENCE_COMMIT_SEC = 0.6;       // this much silence = end of a phrase → transcribe it
+const TAIL_SEC = 0.3;                 // silence kept after the last word
+const PREROLL_SEC = 0.4;              // silence kept before the first word (no clipped consonants)
+const MAX_SEG_SEC = 12;               // continuous speech is force-cut (at the quietest point)
+const MIN_COMMIT_FRAMES = 6;          // < 120 ms of speech = noise, discard
+const PAUSE_MIN_SEC = 1.5;            // gap counted as a pause
+const PAUSE_LONG_SEC = 3.0;           // "//" marker above this
+
+function rmsOf(x) {
+  const n = x.length;
+  if (!n) return 0;
+  let s = 0;
+  for (let i = 0; i < n; i++) s += x[i] * x[i];
+  return Math.sqrt(s / n);
 }
 
-function resampleAudio(input, fromRate, toRate = 16000) {
-  if (fromRate === toRate) return input;
-  const ratio = fromRate / toRate;
-  const outputLength = Math.floor(input.length / ratio);
-  const output = new Float32Array(outputLength);
-  for (let i = 0; i < outputLength; i++) {
-    const pos = i * ratio;
-    const left = Math.floor(pos);
-    const right = Math.min(left + 1, input.length - 1);
-    const frac = pos - left;
-    output[i] = input[left] * (1 - frac) + input[right] * frac;
+function concatF32(a, b) {
+  if (!a.length) return b;
+  const o = new Float32Array(a.length + b.length);
+  o.set(a); o.set(b, a.length);
+  return o;
+}
+
+// ─── Streaming resampler (area-average; keeps fractional phase across chunks) ───
+class StreamResampler {
+  constructor(srcRate, dstRate = ASR_SR) {
+    this.ratio = srcRate / dstRate;
+    this.left = new Float32Array(0);
+    this.t = 0;
   }
-  return output;
-}
-
-function updateLiveTranscript() {
-  const text = liveTranscriptParts.join(' ').replace(/\s+/g, ' ').trim();
-  finalTranscript = text;
-  document.getElementById('final-text').textContent = text;
-  document.getElementById('interim-text').textContent = '';
-  document.getElementById('transcript-placeholder').style.display = text ? 'none' : 'flex';
-  const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
-  const elapsed = sessionStartTime ? Math.max((Date.now() - sessionStartTime) / 1000, 1) : 1;
-  fillerCountLive = countFillers(text);
-  updateLiveMetrics(Math.round(words / elapsed * 60), words, fillerCountLive);
-}
-
-function enqueueAudioChunk(samples, sampleRate) {
-  if (!samples || !samples.length) return;
-  const copy = new Float32Array(samples);
-  transcriptionQueue = transcriptionQueue.then(async () => {
-    if (!asrPipeline) await loadLocalASR();
-    const audio16k = resampleAudio(copy, sampleRate, 16000);
-    if (!audio16k.length) return;
-    setStatus('recording', 'Transcribing locally…');
-    const result = await asrPipeline(audio16k, {
-      sampling_rate: 16000,
-      language: currentLang === 'en' ? 'english' : 'indonesian',
-      task: 'transcribe'
-    });
-    const part = (result.text || '').trim();
-    if (part) {
-      // Remove exact repeated text at chunk boundaries, which Whisper can sometimes emit.
-      const previous = liveTranscriptParts.length ? liveTranscriptParts[liveTranscriptParts.length - 1] : '';
-      if (part !== previous) liveTranscriptParts.push(part);
-      updateLiveTranscript();
+  process(inp) {
+    if (this.ratio === 1) return new Float32Array(inp);
+    const data = concatF32(this.left, inp);
+    const ratio = this.ratio;
+    const out = [];
+    let t = this.t;
+    while (t + ratio <= data.length) {
+      const b = t + ratio;
+      let s = 0;
+      for (let j = Math.floor(t), e = Math.ceil(b); j < e; j++) {
+        s += data[j] * (Math.min(j + 1, b) - Math.max(j, t));
+      }
+      out.push(s / ratio);
+      t = b;
     }
-    if (sessionActive) setStatus('recording', 'Local transcription active');
-  }).catch(e => {
-    console.error('Local streaming transcription failed:', e);
-    const detail = (e && (e.message || String(e))) ? (e.message || String(e)) : 'Unknown ASR error';
-    // Show the actual inference error in the app so it is easier to diagnose.
-    setStatus('idle', `ASR error: ${detail}`.slice(0, 220));
+    const used = Math.floor(t);
+    this.left = data.slice(used);
+    this.t = t - used;
+    return Float32Array.from(out);
+  }
+}
+
+// ─── Segmenter: VAD + phrase cutting + pause measurement ───
+class Segmenter {
+  constructor() { this.reset(); }
+
+  reset() {
+    this.buf = new Float32Array(0);   // audio not yet sent to ASR
+    this.bufStartT = 0;               // absolute time (s) of buf[0]
+    this.rem = new Float32Array(0);
+    this.samples = 0;
+    this.nFrames = 0;
+    this.noise = 0.003;               // adaptive noise floor (RMS)
+    this.voicedRun = 0;
+    this.runStartT = 0;
+    this.speaking = false;
+    this.everSpoke = false;
+    this.lastSpeechEndT = 0;
+    this.firstSpeechT = 0;
+    this.pauses = [];                 // [{time, duration}]  (time = when silence began)
+    this.commits = [];
+    this.segCounter = 0;
+    this.curId = 0;
+    this.cur = this._newSeg();
+  }
+
+  _newSeg() {
+    this.curId++;
+    return { hasSpeech: false, voicedFrames: 0, pauseBefore: 0, startT: 0 };
+  }
+
+  get totalSec() { return this.samples / ASR_SR; }
+  threshold() { return Math.min(0.06, Math.max(0.009, this.noise * 3)); }
+
+  push(x) {
+    if (!x || !x.length) return;
+    this.buf = concatF32(this.buf, x);
+    this.samples += x.length;
+    const data = this.rem.length ? concatF32(this.rem, x) : x;
+    let i = 0;
+    for (; i + FRAME <= data.length; i += FRAME) {
+      this._frame(rmsOf(data.subarray(i, i + FRAME)));
+    }
+    this.rem = data.slice(i);
+    this._maybeCommit();
+  }
+
+  _frame(rms) {
+    this.nFrames++;
+    const tEnd = this.nFrames * FRAME_SEC;
+    const tStart = tEnd - FRAME_SEC;
+    if (rms > this.threshold()) {
+      if (this.voicedRun === 0) this.runStartT = tStart;
+      this.voicedRun++;
+      if (this.voicedRun >= MIN_RUN_FRAMES) {
+        if (!this.speaking) { this.speaking = true; this._onset(this.runStartT); }
+        this.lastSpeechEndT = tEnd;
+        this.cur.voicedFrames += (this.voicedRun === MIN_RUN_FRAMES) ? MIN_RUN_FRAMES : 1;
+      }
+    } else {
+      this.voicedRun = 0;
+      this.noise += (rms - this.noise) * (rms < this.noise ? 0.2 : 0.01);
+      this.noise = Math.min(0.03, Math.max(0.0005, this.noise));
+      if (this.speaking && tEnd - this.lastSpeechEndT > HANGOVER_SEC) this.speaking = false;
+    }
+  }
+
+  _onset(startT) {
+    let gap = this.everSpoke ? startT - this.lastSpeechEndT : 0;
+    if (gap >= PAUSE_MIN_SEC) {
+      this.pauses.push({ time: this.lastSpeechEndT, duration: Math.round(gap * 10) / 10 });
+    } else {
+      gap = 0;
+    }
+    if (!this.everSpoke) { this.everSpoke = true; this.firstSpeechT = startT; }
+    if (!this.cur.hasSpeech) {
+      this.cur.hasSpeech = true;
+      this.cur.pauseBefore = gap;
+      this.cur.startT = startT;
+    }
+  }
+
+  _maybeCommit() {
+    const dur = this.buf.length / ASR_SR;
+    if (!this.cur.hasSpeech) {
+      // nothing worth transcribing yet: keep only a short pre-roll
+      const keep = Math.round(PREROLL_SEC * ASR_SR);
+      if (this.buf.length > keep * 2) this._dropFront(this.buf.length - keep);
+      return;
+    }
+    const silence = this.nFrames * FRAME_SEC - this.lastSpeechEndT;
+    if (silence >= SILENCE_COMMIT_SEC) {
+      this._emit(Math.min(this.lastSpeechEndT + TAIL_SEC, this.bufStartT + dur), 'pause');
+    } else if (dur >= MAX_SEG_SEC) {
+      this._emit(this._quietestPoint(), 'max');
+    }
+  }
+
+  _quietestPoint() {
+    const total = this.buf.length;
+    const lo = Math.max(Math.round(0.5 * ASR_SR), total - 3 * ASR_SR);
+    const hi = total - Math.round(0.3 * ASR_SR);
+    let best = hi, bestE = Infinity;
+    for (let s = lo; s + FRAME <= hi; s += FRAME / 2) {
+      const e = rmsOf(this.buf.subarray(s, s + FRAME));
+      if (e < bestE) { bestE = e; best = s + FRAME / 2; }
+    }
+    return this.bufStartT + best / ASR_SR;
+  }
+
+  _emit(cutT, reason) {
+    const c = this.cur;
+    let idx = Math.round((cutT - this.bufStartT) * ASR_SR);
+    idx = Math.max(0, Math.min(idx, this.buf.length));
+    if (c.voicedFrames >= MIN_COMMIT_FRAMES && idx > 0.15 * ASR_SR) {
+      this.commits.push({
+        id: ++this.segCounter,
+        audio: this.buf.slice(0, idx),
+        pauseBefore: c.pauseBefore,
+        startT: c.startT,
+        endT: cutT,
+        voicedSec: c.voicedFrames * FRAME_SEC,
+        reason
+      });
+    }
+    this._dropFront(idx);
+    if (reason === 'max') {
+      this.curId++;
+      this.cur = { hasSpeech: true, voicedFrames: MIN_RUN_FRAMES, pauseBefore: 0, startT: cutT };
+    } else {
+      this.cur = this._newSeg();
+    }
+  }
+
+  _dropFront(n) {
+    this.buf = this.buf.slice(n);
+    this.bufStartT += n / ASR_SR;
+  }
+
+  takeCommits() { const o = this.commits; this.commits = []; return o; }
+
+  // call when the user presses Stop: emits whatever speech is still buffered
+  flush() {
+    if (this.cur.hasSpeech) {
+      this._emit(Math.min(this.lastSpeechEndT + TAIL_SEC, this.bufStartT + this.buf.length / ASR_SR), 'stop');
+    }
+    return this.takeCommits();
+  }
+
+  // snapshot of the phrase currently being spoken (for the live "interim" text)
+  peekInterim() {
+    const c = this.cur;
+    if (!c.hasSpeech || c.voicedFrames < 30) return null;
+    return { key: this.curId, audio: this.buf.slice(0), voicedSec: c.voicedFrames * FRAME_SEC };
+  }
+
+  // seconds of silence since the last word (live pause indicator)
+  currentSilence() {
+    if (!this.everSpoke || this.speaking) return 0;
+    return Math.max(0, this.nFrames * FRAME_SEC - this.lastSpeechEndT);
+  }
+
+  // time actually spent talking = speaking span minus the long pauses
+  articulationSec() {
+    if (!this.everSpoke) return 0;
+    const span = this.lastSpeechEndT - this.firstSpeechT;
+    const paused = this.pauses.reduce((a, p) => a + p.duration, 0);
+    return Math.max(0, span - paused);
+  }
+}
+
+// ─── Whisper output clean-up ───
+const HALLUCINATION_RE = /thanks? for watching|thank you for watching|please subscribe|don'?t forget to (like|subscribe)|subtitles? by[^.]*|transcribed by[^.]*|amara\.org[^.]*|terima kasih (telah|sudah) menonton|subtitle oleh[^.]*|terjemahan oleh[^.]*|jangan lupa (subscribe|like)[^.]*/gi;
+
+function cleanAsrText(raw) {
+  let t = (raw || '').replace(/\s+/g, ' ').trim();
+  t = t.replace(/[\[\(][^\]\)]*[\]\)]/g, ' ');         // [Music] (applause) [BLANK_AUDIO]
+  t = t.replace(HALLUCINATION_RE, ' ');
+  // the same 1–4 word phrase repeated 4+ times = decoder loop → keep one
+  t = t.replace(/\b((?:[\w']+\s+){0,3}[\w']+)(?:[\s,.!?]+\1\b){3,}/gi, '$1');
+  t = t.replace(/(^|\s)[.!?,]+(?=\s|$)/g, ' ');          // punctuation left behind by the removals
+  t = t.replace(/\s+/g, ' ').trim();
+  if (!/[A-Za-zÀ-ÿ0-9]/.test(t)) return '';
+  return t;
+}
+
+// ═══════════════════════════════════════════════════
+//  LOCAL SPEECH ENGINE — GLUE (mic, Whisper Web Worker, UI updates)
+//  Everything runs on this device: Whisper (Hugging Face / ONNX) executes in a
+//  Web Worker via WebGPU (fast) or WASM (fallback). No external speech API.
+// ═══════════════════════════════════════════════════
+const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2';
+
+// Runs inside the worker (serialised with .toString()), so inference never blocks the UI.
+function __asrWorkerMain() {
+  let asr = null, fast = null, tf = null, attempts = [], cur = null, lang = 'en';
+  let chain = Promise.resolve();
+  const post = (m) => self.postMessage(m);
+
+  async function loadFrom(start, loadId) {
+    const { pipeline, env } = tf;
+    env.allowLocalModels = false;
+    env.useBrowserCache = true;
+    for (let i = start; i < attempts.length; i++) {
+      const a = attempts[i];
+      const files = {};
+      try {
+        post({ type: 'status', text: 'Loading ' + a.label + '…' });
+        asr = await pipeline('automatic-speech-recognition', a.model, {
+          device: a.device,
+          dtype: a.dtype,
+          progress_callback: (p) => {
+            if (!p || !p.file) return;
+            if (p.status === 'progress' && p.total) files[p.file] = { l: p.loaded, t: p.total };
+            else if (p.status === 'done' && files[p.file]) files[p.file].l = files[p.file].t;
+            else return;
+            let l = 0, t = 0;
+            for (const k in files) { l += files[k].l; t += files[k].t; }
+            if (t) post({ type: 'progress', pct: Math.round(100 * l / t), label: a.label });
+          }
+        });
+        // warm-up: compiles WebGPU shaders / WASM kernels so the first phrase isn't slow
+        post({ type: 'status', text: 'Warming up ' + a.label + '…' });
+        await asr(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, a.english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
+        cur = Object.assign({ i }, a);
+        post({ type: 'ready', loadId, lang, info: { label: a.label, device: a.device, english: a.english } });
+        if (a.device !== 'webgpu') loadFast(a.english);        // background: small model for instant live preview
+        return true;
+      } catch (err) {
+        console.warn('ASR attempt failed:', a.label, err);
+        asr = null;
+      }
+    }
+    return false;
+  }
+
+  async function loadFast(english) {
+    const myLang = lang;
+    try {
+      const model = english ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-base';
+      const p = await tf.pipeline('automatic-speech-recognition', model, { device: 'wasm', dtype: 'q8' });
+      if (myLang !== lang) return;                                   // language changed meanwhile
+      await p(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
+      fast = p;
+      post({ type: 'fastready', label: model.split('/').pop() });
+    } catch (err) { console.warn('fast preview model unavailable:', err); fast = null; }
+  }
+
+  self.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'load') {
+      chain = chain.then(async () => {
+        try {
+          if (!tf) tf = await import(m.cdn);
+          attempts = m.attempts; lang = m.lang; fast = null;
+          const ok = await loadFrom(0, m.loadId);
+          if (!ok) post({ type: 'loaderror', loadId: m.loadId, message: 'No speech model could be loaded (check internet for the first download).' });
+        } catch (err) {
+          post({ type: 'loaderror', loadId: m.loadId, message: String((err && err.message) || err) });
+        }
+      });
+    } else if (m.type === 'run') {
+      chain = chain.then(async () => {
+        const go = () => ((m.fast && fast) ? fast : asr)(m.audio, m.opts);
+        try {
+          let out;
+          try { out = await go(); }
+          catch (err) {
+            // WebGPU can fail at inference time on some drivers → fall back to the next model/device once
+            if (cur && cur.device === 'webgpu' && await loadFrom(cur.i + 1, null)) out = await go();
+            else throw err;
+          }
+          post({ type: 'result', id: m.id, text: (out && out.text) || '' });
+        } catch (err) {
+          post({ type: 'result', id: m.id, error: String((err && err.message) || err) });
+        }
+      });
+    }
+  };
+}
+
+// ─── model choice: biggest/fastest that this device can run ───
+async function detectWebGPU() {
+  try {
+    if (!navigator.gpu) return false;
+    return !!(await navigator.gpu.requestAdapter());
+  } catch (e) { return false; }
+}
+
+function buildAttempts(lang, gpu) {
+  const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
+  const mk = (model, device, dtype, english) => ({
+    model, device, dtype, english,
+    label: 'Whisper ' + model.split('/').pop().replace(/^whisper-|^distil-/, (m) => m === 'distil-' ? 'distil ' : '') +
+           (device === 'webgpu' ? ' · WebGPU' : ' · CPU')
+  });
+  const list = [];
+  if (lang === 'en') {
+    if (gpu) {
+      list.push(mk('onnx-community/distil-small.en', 'webgpu', gpuDtype, true));   // ≈ small.en accuracy, much faster
+      list.push(mk('onnx-community/whisper-small.en', 'webgpu', gpuDtype, true));
+    }
+    list.push(mk('onnx-community/whisper-base.en', 'wasm', 'q8', true));
+  } else {
+    if (gpu) list.push(mk('onnx-community/whisper-small', 'webgpu', gpuDtype, false));
+    list.push(mk('onnx-community/whisper-small', 'wasm', 'q8', false));
+  }
+  return list;
+}
+
+// ─── worker plumbing ───
+let asrWorker = null, asrReadyLang = null, asrInfo = null, asrLoadLang = null, asrLoadPromise = null;
+let asrGpu = null, asrLoadSeq = 0, asrRunSeq = 0;
+const asrPendingLoads = {};
+const asrRunWaiters = {};
+
+function setMeta(t) {
+  const el = document.getElementById('status-meta');
+  if (el) el.textContent = t || '';
+}
+function modelMeta() { return asrInfo ? asrInfo.label + (asrInfo.fast ? ' · live: ' + asrInfo.fast : '') : ''; }
+
+function onAsrMessage(e) {
+  const m = e.data;
+  if (m.type === 'progress') {
+    if (!sessionActive) setMeta('Downloading ' + m.label + ' ' + m.pct + '%');
+  } else if (m.type === 'status') {
+    if (!sessionActive) setMeta(m.text);
+  } else if (m.type === 'ready') {
+    asrInfo = m.info; asrReadyLang = m.lang;
+    const p = asrPendingLoads[m.loadId];
+    if (p) { delete asrPendingLoads[m.loadId]; p.resolve(); }
+    if (!sessionActive) setMeta('✓ ' + modelMeta());
+  } else if (m.type === 'fastready') {
+    if (asrInfo) asrInfo.fast = m.label;
+    if (!sessionActive) setMeta('✓ ' + modelMeta());
+  } else if (m.type === 'loaderror') {
+    const p = asrPendingLoads[m.loadId];
+    if (p) { delete asrPendingLoads[m.loadId]; p.reject(new Error(m.message)); }
+  } else if (m.type === 'result') {
+    const w = asrRunWaiters[m.id];
+    if (w) { delete asrRunWaiters[m.id]; w(m); }
+  }
+}
+
+function ensureModel(lang) {
+  if (asrReadyLang === lang) return Promise.resolve();
+  if (asrLoadPromise && asrLoadLang === lang) return asrLoadPromise;
+  asrLoadLang = lang;
+  asrLoadPromise = (async () => {
+    if (asrGpu === null) asrGpu = await detectWebGPU();
+    if (!asrWorker) {
+      const blob = new Blob(['(' + __asrWorkerMain.toString() + ')();'], { type: 'text/javascript' });
+      asrWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+      asrWorker.onmessage = onAsrMessage;
+      asrWorker.onerror = (ev) => console.error('ASR worker error:', ev.message || ev);
+    }
+    await new Promise((resolve, reject) => {
+      const loadId = ++asrLoadSeq;
+      asrPendingLoads[loadId] = { resolve, reject };
+      asrWorker.postMessage({ type: 'load', loadId, lang, cdn: TRANSFORMERS_CDN, attempts: buildAttempts(lang, asrGpu) });
+    });
+  })();
+  asrLoadPromise.catch(() => { if (asrLoadLang === lang) asrLoadPromise = null; });
+  return asrLoadPromise;
+}
+
+function warmupAsr() {
+  ensureModel(currentLang).catch((e) => {
+    console.error(e);
+    if (!sessionActive) setStatus('idle', ('Model error: ' + (e.message || e)).slice(0, 200));
   });
 }
 
+function asrRun(audio, opts, fast) {
+  return new Promise((resolve) => {
+    const id = ++asrRunSeq;
+    const timer = setTimeout(() => {                 // worker died / hung: don't freeze the session
+      if (asrRunWaiters[id]) { delete asrRunWaiters[id]; resolve({ id, error: 'ASR timed out' }); }
+    }, 90000);
+    asrRunWaiters[id] = (m) => { clearTimeout(timer); resolve(m); };
+    asrWorker.postMessage({ type: 'run', id, audio, opts, fast: !!fast }, [audio.buffer]);
+  });
+}
+
+// Whisper behaves better when quiet recordings are brought to a normal level
+function prepAudio(a) {
+  let peak = 0;
+  for (let i = 0; i < a.length; i++) { const v = Math.abs(a[i]); if (v > peak) peak = v; }
+  const out = new Float32Array(a.length);
+  const g = (peak > 0 && peak < 0.4) ? Math.min(0.6 / peak, 12) : 1;
+  for (let i = 0; i < a.length; i++) out[i] = a[i] * g;
+  return out;
+}
+
+function decodeOpts(sec) {
+  // token cap ≈ speaking speed × duration: stops runaway repetition loops, saves time
+  const o = { max_new_tokens: Math.min(400, Math.ceil(sec * 10) + 24) };
+  if (!asrInfo || !asrInfo.english) { o.language = currentLang === 'id' ? 'indonesian' : 'english'; o.task = 'transcribe'; }
+  return o;
+}
+
+// ─── session state ───
+let seg = null, resampler = null;
+let commitQueue = [], asrBusy = false, sessionEpoch = 0;
+let interimText = '', pendingPause = 0, lastInferMs = 0, lastInterimMs = 0, lastInterimAt = 0;
+let micStream = null, audioCtx = null, srcNode = null, procNode = null, muteNode = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function appendFinal(text, gap) {
+  if (gap >= PAUSE_MIN_SEC && finalTranscript.trim()) finalTranscript += (gap >= PAUSE_LONG_SEC ? '// ' : '/ ');
+  finalTranscript += text + ' ';
+}
+
+function interimDue() {
+  if (!sessionActive) return null;
+  // adaptive: never queue interim work faster than the device can finish it
+  if (performance.now() - lastInterimAt < Math.max(600, lastInterimMs * 0.8)) return null;
+  return seg.peekInterim();
+}
+
+async function runCommit(job, epoch) {
+  const t0 = performance.now();
+  const out = await asrRun(prepAudio(job.audio), decodeOpts(job.audio.length / ASR_SR));
+  lastInferMs = performance.now() - t0;
+  if (epoch !== sessionEpoch) return;
+  if (out.error) throw new Error(out.error);
+  const text = cleanAsrText(out.text);
+  const gap = Math.max(job.pauseBefore, pendingPause);
+  if (text) { appendFinal(text, gap); pendingPause = 0; }
+  else if (gap) pendingPause = gap;            // segment was noise → keep its pause for the next phrase
+  interimText = '';
+  renderLive();
+}
+
+async function runInterim(it, epoch) {
+  const t0 = performance.now();
+  const out = await asrRun(prepAudio(it.audio), decodeOpts(it.audio.length / ASR_SR), true);   // small model → fast preview
+  lastInterimMs = performance.now() - t0;
+  lastInterimAt = performance.now();
+  if (epoch !== sessionEpoch) return;
+  if (out.error) throw new Error(out.error);
+  if (it.key === seg.curId) { interimText = cleanAsrText(out.text); renderLive(); }
+}
+
+async function pump() {
+  if (asrBusy) return;
+  asrBusy = true;
+  const epoch = sessionEpoch;
+  try {
+    while (epoch === sessionEpoch) {
+      const job = commitQueue.shift();
+      if (job) { await runCommit(job, epoch); continue; }
+      const it = interimDue();
+      if (it) { await runInterim(it, epoch); continue; }
+      break;
+    }
+  } catch (e) {
+    console.error('ASR error:', e);
+    if (epoch === sessionEpoch) setMeta(('ASR error: ' + (e.message || e)).slice(0, 160));
+  } finally {
+    asrBusy = false;
+  }
+}
+
+async function drainQueue() {
+  while (commitQueue.length || asrBusy) { pump(); await sleep(60); }
+}
+
+function liveStats() {
+  const clean = finalTranscript.replace(/\s*\/+\s*/g, ' ').trim();
+  const text = (clean + ' ' + interimText).trim();
+  const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+  return { text, words };
+}
+
+function renderLive() {
+  const has = finalTranscript || interimText;
+  document.getElementById('transcript-placeholder').style.display = has ? 'none' : 'flex';
+  document.getElementById('final-text').textContent = finalTranscript;
+  document.getElementById('interim-text').textContent = interimText;
+  const area = document.getElementById('transcript-area');
+  area.scrollTop = area.scrollHeight;
+  const { text, words } = liveStats();
+  fillerCountLive = countFillers(text);
+  const elapsed = seg ? seg.totalSec : 0;
+  updateLiveMetrics(elapsed > 3 ? Math.round(words / elapsed * 60) : 0, words, fillerCountLive);
+}
+
+// ─── session control ───
+function teardownAudio() {
+  try { if (procNode) { procNode.onaudioprocess = null; procNode.disconnect(); } } catch (_) {}
+  try { if (srcNode) srcNode.disconnect(); } catch (_) {}
+  try { if (muteNode) muteNode.disconnect(); } catch (_) {}
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
+  procNode = srcNode = muteNode = micStream = audioCtx = null;
+}
+
 async function startSession() {
-  finalTranscript = ''; pauses = []; lastResultTime = null; wordCount = 0; fillerCountLive = 0;
-  audioChunks = []; recordingBlob = null; liveSamples = []; liveTranscriptParts = [];
-  transcriptionQueue = Promise.resolve(); isFinalizing = false;
+  sessionEpoch++;
+  seg = new Segmenter();
+  commitQueue = []; interimText = ''; pendingPause = 0; lastInterimAt = 0;
+  finalTranscript = ''; pauses = []; fillerCountLive = 0; sessionDuration = 0;
   document.getElementById('final-text').textContent = '';
   document.getElementById('interim-text').textContent = '';
   document.getElementById('transcript-placeholder').style.display = 'flex';
   document.getElementById('report-section').classList.remove('visible');
   updateLiveMetrics(0, 0, 0);
   document.getElementById('live-duration').textContent = '0:00';
+  document.getElementById('btn-start').disabled = true;
   try {
-    // Load model before recording so first-use download does not lose the opening words.
-    await loadLocalASR();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+    // create the AudioContext inside the click so the browser lets it run even if the model is still loading
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+    setStatus('analyzing', 'Loading speech model…');
+    while (asrReadyLang !== currentLang) await ensureModel(currentLang);   // normally already preloaded
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: {
       channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true
     }});
-    audioContextLive = new (window.AudioContext || window.webkitAudioContext)();
-    await audioContextLive.resume();
-    micSource = audioContextLive.createMediaStreamSource(stream);
-    // ScriptProcessor provides PCM frames; Whisper runs locally on rolling 4-second windows.
-    audioProcessor = audioContextLive.createScriptProcessor(4096, 1, 1);
-    let chunkBuffer = [];
-    let chunkSamples = 0;
-    const targetSamples = Math.round(audioContextLive.sampleRate * LIVE_CHUNK_SECONDS);
-    audioProcessor.onaudioprocess = e => {
+    await audioCtx.resume();
+    resampler = new StreamResampler(audioCtx.sampleRate);
+    srcNode = audioCtx.createMediaStreamSource(micStream);
+    procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    procNode.onaudioprocess = (e) => {
       if (!sessionActive) return;
-      const frame = e.inputBuffer.getChannelData(0);
-      const frameCopy = new Float32Array(frame);
-      chunkBuffer.push(frameCopy);
-      chunkSamples += frameCopy.length;
-      if (chunkSamples >= targetSamples) {
-        const joined = new Float32Array(chunkSamples);
-        let offset = 0;
-        for (const piece of chunkBuffer) { joined.set(piece, offset); offset += piece.length; }
-        enqueueAudioChunk(joined, audioContextLive.sampleRate);
-        chunkBuffer = []; chunkSamples = 0;
-      }
+      seg.push(resampler.process(e.inputBuffer.getChannelData(0)));
+      const c = seg.takeCommits();
+      if (c.length) commitQueue.push(...c);
+      pump();
     };
-    // Keep a reference so Stop can flush the remaining samples.
-    audioProcessor._getPendingAudio = () => {
-      if (!chunkSamples) return null;
-      const joined = new Float32Array(chunkSamples);
-      let offset = 0;
-      for (const piece of chunkBuffer) { joined.set(piece, offset); offset += piece.length; }
-      chunkBuffer = []; chunkSamples = 0;
-      return joined;
-    };
-    micSource.connect(audioProcessor);
-    audioProcessor.connect(audioContextLive.destination);
-    // Mute the processor output to avoid microphone feedback while keeping the graph active.
-    const mute = audioContextLive.createGain(); mute.gain.value = 0;
-    audioProcessor.disconnect(); audioProcessor.connect(mute); mute.connect(audioContextLive.destination);
-    audioProcessor._muteNode = mute;
-    sessionStartTime = Date.now(); sessionActive = true;
+    muteNode = audioCtx.createGain(); muteNode.gain.value = 0;      // keep graph alive, no feedback
+    srcNode.connect(procNode); procNode.connect(muteNode); muteNode.connect(audioCtx.destination);
+
+    sessionActive = true;
+    sessionStartTime = Date.now();
     sessionTimerInterval = setInterval(() => {
-      document.getElementById('live-duration').textContent = formatTime((Date.now()-sessionStartTime)/1000);
+      document.getElementById('live-duration').textContent = formatTime(seg.totalSec);
+      const sil = seg.currentSilence();
+      setMeta(sil >= PAUSE_MIN_SEC ? '⏸ pause ' + sil.toFixed(1) + 's' : modelMeta());
+      renderLive();
     }, 500);
-    setStatus('recording', 'Local transcription active · updates every few seconds');
-    document.getElementById('btn-start').disabled = true;
+    setStatus('recording', modelMeta());
     document.getElementById('btn-stop').disabled = false;
-    // Save stream so it can be stopped cleanly.
-    audioProcessor._stream = stream;
   } catch (e) {
-    console.error(e); sessionActive = false;
-    if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
-    if (audioContextLive) { try { await audioContextLive.close(); } catch(_) {} }
-    setStatus('idle', 'Microphone permission/model download is required');
-    alert('Please allow microphone access and ensure the open-source model can be downloaded, then try again.');
+    console.error(e);
+    sessionActive = false;
+    teardownAudio();
+    document.getElementById('btn-start').disabled = false;
+    setStatus('idle', 'Microphone permission / model download is required');
+    alert('Please allow microphone access and make sure the speech model can be downloaded (needs internet only the first time), then try again.');
   }
 }
 
 async function stopSession() {
-  if (!sessionActive && !audioContextLive) return;
-  sessionActive = false; clearInterval(sessionTimerInterval);
-  try {
-    if (audioProcessor && audioProcessor._getPendingAudio) {
-      const pending = audioProcessor._getPendingAudio();
-      if (pending && pending.length) enqueueAudioChunk(pending, audioContextLive.sampleRate);
-    }
-    if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
-    if (micSource) { try { micSource.disconnect(); } catch(_) {} }
-    if (audioProcessor && audioProcessor._muteNode) { try { audioProcessor._muteNode.disconnect(); } catch(_) {} }
-    if (audioProcessor && audioProcessor._stream) audioProcessor._stream.getTracks().forEach(track => track.stop());
-    setStatus('analyzing', 'Finishing local transcription…');
-    await transcriptionQueue;
-    if (audioContextLive) { try { await audioContextLive.close(); } catch(_) {} }
-    audioContextLive = null; micSource = null; audioProcessor = null;
-    updateLiveTranscript();
-    const duration = sessionStartTime ? (Date.now()-sessionStartTime)/1000 : 0;
-    document.getElementById('live-duration').textContent = formatTime(duration);
-    buildReport();
-  } finally {
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-stop').disabled = true;
-  }
+  if (!sessionActive) return;
+  sessionActive = false;
+  clearInterval(sessionTimerInterval);
+  document.getElementById('btn-stop').disabled = true;
+  teardownAudio();
+  setStatus('analyzing', 'Finishing local transcription…');
+  commitQueue.push(...seg.flush());
+  await drainQueue();
+  interimText = '';
+  renderLive();
+  sessionDuration = seg.totalSec;
+  document.getElementById('live-duration').textContent = formatTime(sessionDuration);
+  buildReport();
+  document.getElementById('btn-start').disabled = false;
 }
 
 function resetSession() {
   sessionActive = false; clearInterval(sessionTimerInterval);
-  if (audioProcessor) { try { audioProcessor.disconnect(); } catch(_) {} }
-  if (micSource) { try { micSource.disconnect(); } catch(_) {} }
-  if (audioProcessor && audioProcessor._stream) audioProcessor._stream.getTracks().forEach(track => track.stop());
-  if (audioContextLive) { try { audioContextLive.close(); } catch(_) {} }
-  audioContextLive = null; micSource = null; audioProcessor = null;
-  audioChunks = []; liveSamples = []; liveTranscriptParts = []; transcriptionQueue = Promise.resolve();
-  finalTranscript = ''; pauses = []; wordCount = 0; fillerCountLive = 0; lastResultTime = null;
+  sessionEpoch++;                                   // any in-flight result is discarded
+  teardownAudio();
+  commitQueue = []; interimText = ''; pendingPause = 0;
+  seg = null; finalTranscript = ''; pauses = []; fillerCountLive = 0; sessionDuration = 0;
   document.getElementById('final-text').textContent = '';
   document.getElementById('interim-text').textContent = '';
   document.getElementById('transcript-placeholder').style.display = 'flex';
@@ -1447,9 +1912,10 @@ function resetSession() {
   document.getElementById('live-fillers').textContent = '0';
   document.getElementById('btn-start').disabled = false;
   document.getElementById('btn-stop').disabled = true;
-  setStatus('idle');
+  setStatus('idle', asrReadyLang === currentLang ? '✓ ' + modelMeta() : '');
 }
 function updateUI() { document.getElementById('btn-stop').disabled = true; }
+
 
 // ═══════════════════════════════════════════════════
 //  ANALYSIS ENGINE
@@ -1494,7 +1960,7 @@ function extractKeywords(text) {
 
 function highlightFillers(text) {
   if (!text.trim()) return '';
-  let result = text;
+  let result = escapeHtml(text);
   // Style pause markers FIRST (longest token first to avoid double-replacement)
   result = result.replace(/ \/{2} /g, '<span class="pause-marker long" title="Long pause (>3s)">//</span>');
   result = result.replace(/ \/ /g, '<span class="pause-marker short" title="Short pause (1.5–3s)">/</span>');
@@ -1507,13 +1973,22 @@ function highlightFillers(text) {
   return result;
 }
 
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildReport() {
-  const duration = sessionStartTime ? (Date.now() - sessionStartTime) / 1000 : 0;
+  const duration = sessionDuration || (sessionStartTime ? (Date.now() - sessionStartTime) / 1000 : 0);
   const text = finalTranscript.trim();
+  // pauses come from the audio timeline (VAD), not from the ASR text
+  pauses = seg ? seg.pauses.map(p => ({ duration: p.duration, time: formatTime(p.time) })) : [];
+  articulationTime = seg ? seg.articulationSec() : 0;
+  const pauseTotal = Math.round(pauses.reduce((s, p) => s + p.duration, 0) * 10) / 10;
+  const pauseLongest = pauses.reduce((m, p) => Math.max(m, p.duration), 0);
   // Strip pause markers before counting words / WPM
   const cleanText = text.replace(/\s*\/+\s*/g, ' ');
   const words = cleanText ? cleanText.split(/\s+/).filter(Boolean) : [];
@@ -1530,9 +2005,9 @@ function buildReport() {
   const stats = [
     { icon: '⏱️', val: formatTime(duration), lbl: currentLang==='en'?'Duration':'Durasi', sub: '' },
     { icon: '💬', val: totalWords, lbl: currentLang==='en'?'Total Words':'Total Kata', sub: '' },
-    { icon: '📈', val: wpm, lbl: currentLang==='en'?'Avg WPM':'Rata-rata KPM', sub: currentLang==='en'?'Words per minute':'Kata per menit' },
-    { icon: '🔴', val: totalFillers, lbl: currentLang==='en'?'Filler Words':'Kata Filler', sub: `${fillerPct}% of words` },
-    { icon: '⏸️', val: pauses.length, lbl: currentLang==='en'?'Pauses':'Jeda', sub: currentLang==='en'?'Not estimated in batch mode':'Tidak diestimasi pada mode batch' },
+    { icon: '📈', val: wpm, lbl: currentLang==='en'?'Avg WPM':'Rata-rata KPM', sub: articulationTime > 3 ? Math.round(totalWords / articulationTime * 60) + (currentLang==='en'?' excl. pauses':' tanpa jeda') : (currentLang==='en'?'Words per minute':'Kata per menit') },
+    { icon: '🔴', val: totalFillers, lbl: currentLang==='en'?'Filler Words':'Kata Filler', sub: `${fillerPct}% ${currentLang==='en'?'of words':'dari kata'}` },
+    { icon: '⏸️', val: pauses.length, lbl: currentLang==='en'?'Pauses':'Jeda', sub: pauses.length ? (currentLang==='en'?'>1.5s · total ':'>1,5s · total ') + pauseTotal + 's' : (currentLang==='en'?'>1.5s gaps':'>1,5s jeda') },
     { icon: '🔑', val: keywords.length, lbl: currentLang==='en'?'Key Topics':'Topik Kunci', sub: '' },
   ];
   statsGrid.innerHTML = stats.map(s => `
@@ -1564,7 +2039,7 @@ function buildReport() {
 
   // ─── Pauses ───
   const pauseList = document.getElementById('pause-list');
-  document.getElementById('pause-summary').textContent = LABELS[currentLang].pauseSummary(pauses.length);
+  document.getElementById('pause-summary').textContent = LABELS[currentLang].pauseSummary(pauses.length, pauseTotal, pauseLongest);
   pauseList.innerHTML = pauses.length > 0
     ? pauses.map(p => `
         <div class="pause-item">
