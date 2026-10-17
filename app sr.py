@@ -1275,7 +1275,7 @@ const FRAME = 320;                    // 20 ms @ 16 kHz
 const FRAME_SEC = FRAME / ASR_SR;
 const MIN_RUN_FRAMES = 5;             // 100 ms continuous energy = real speech (ignores clicks)
 const HANGOVER_SEC = 0.35;            // short dips inside a word/phrase are still "speaking"
-const SILENCE_COMMIT_SEC = 0.7;       // this much silence = end of a phrase → transcribe it
+const SILENCE_COMMIT_SEC = 0.6;       // this much silence = end of a phrase → transcribe it
 const TAIL_SEC = 0.3;                 // silence kept after the last word
 const PREROLL_SEC = 0.4;              // silence kept before the first word (no clipped consonants)
 const MAX_SEG_SEC = 12;               // continuous speech is force-cut (at the quietest point)
@@ -1520,7 +1520,7 @@ const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers
 
 // Runs inside the worker (serialised with .toString()), so inference never blocks the UI.
 function __asrWorkerMain() {
-  let asr = null, tf = null, attempts = [], cur = null, lang = 'en';
+  let asr = null, fast = null, tf = null, attempts = [], cur = null, lang = 'en';
   let chain = Promise.resolve();
   const post = (m) => self.postMessage(m);
 
@@ -1551,6 +1551,7 @@ function __asrWorkerMain() {
         await asr(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, a.english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
         cur = Object.assign({ i }, a);
         post({ type: 'ready', loadId, lang, info: { label: a.label, device: a.device, english: a.english } });
+        if (a.device !== 'webgpu') loadFast(a.english);        // background: small model for instant live preview
         return true;
       } catch (err) {
         console.warn('ASR attempt failed:', a.label, err);
@@ -1560,13 +1561,25 @@ function __asrWorkerMain() {
     return false;
   }
 
+  async function loadFast(english) {
+    const myLang = lang;
+    try {
+      const model = english ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-base';
+      const p = await tf.pipeline('automatic-speech-recognition', model, { device: 'wasm', dtype: 'q8' });
+      if (myLang !== lang) return;                                   // language changed meanwhile
+      await p(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
+      fast = p;
+      post({ type: 'fastready', label: model.split('/').pop() });
+    } catch (err) { console.warn('fast preview model unavailable:', err); fast = null; }
+  }
+
   self.onmessage = (e) => {
     const m = e.data;
     if (m.type === 'load') {
       chain = chain.then(async () => {
         try {
           if (!tf) tf = await import(m.cdn);
-          attempts = m.attempts; lang = m.lang;
+          attempts = m.attempts; lang = m.lang; fast = null;
           const ok = await loadFrom(0, m.loadId);
           if (!ok) post({ type: 'loaderror', loadId: m.loadId, message: 'No speech model could be loaded (check internet for the first download).' });
         } catch (err) {
@@ -1575,7 +1588,7 @@ function __asrWorkerMain() {
       });
     } else if (m.type === 'run') {
       chain = chain.then(async () => {
-        const go = () => asr(m.audio, m.opts);
+        const go = () => ((m.fast && fast) ? fast : asr)(m.audio, m.opts);
         try {
           let out;
           try { out = await go(); }
@@ -1632,7 +1645,7 @@ function setMeta(t) {
   const el = document.getElementById('status-meta');
   if (el) el.textContent = t || '';
 }
-function modelMeta() { return asrInfo ? asrInfo.label : ''; }
+function modelMeta() { return asrInfo ? asrInfo.label + (asrInfo.fast ? ' · live: ' + asrInfo.fast : '') : ''; }
 
 function onAsrMessage(e) {
   const m = e.data;
@@ -1644,6 +1657,9 @@ function onAsrMessage(e) {
     asrInfo = m.info; asrReadyLang = m.lang;
     const p = asrPendingLoads[m.loadId];
     if (p) { delete asrPendingLoads[m.loadId]; p.resolve(); }
+    if (!sessionActive) setMeta('✓ ' + modelMeta());
+  } else if (m.type === 'fastready') {
+    if (asrInfo) asrInfo.fast = m.label;
     if (!sessionActive) setMeta('✓ ' + modelMeta());
   } else if (m.type === 'loaderror') {
     const p = asrPendingLoads[m.loadId];
@@ -1683,14 +1699,14 @@ function warmupAsr() {
   });
 }
 
-function asrRun(audio, opts) {
+function asrRun(audio, opts, fast) {
   return new Promise((resolve) => {
     const id = ++asrRunSeq;
     const timer = setTimeout(() => {                 // worker died / hung: don't freeze the session
       if (asrRunWaiters[id]) { delete asrRunWaiters[id]; resolve({ id, error: 'ASR timed out' }); }
     }, 90000);
     asrRunWaiters[id] = (m) => { clearTimeout(timer); resolve(m); };
-    asrWorker.postMessage({ type: 'run', id, audio, opts }, [audio.buffer]);
+    asrWorker.postMessage({ type: 'run', id, audio, opts, fast: !!fast }, [audio.buffer]);
   });
 }
 
@@ -1714,7 +1730,7 @@ function decodeOpts(sec) {
 // ─── session state ───
 let seg = null, resampler = null;
 let commitQueue = [], asrBusy = false, sessionEpoch = 0;
-let interimText = '', pendingPause = 0, lastInferMs = 0, lastInterimAt = 0;
+let interimText = '', pendingPause = 0, lastInferMs = 0, lastInterimMs = 0, lastInterimAt = 0;
 let micStream = null, audioCtx = null, srcNode = null, procNode = null, muteNode = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1726,7 +1742,7 @@ function appendFinal(text, gap) {
 function interimDue() {
   if (!sessionActive) return null;
   // adaptive: never queue interim work faster than the device can finish it
-  if (performance.now() - lastInterimAt < Math.max(1000, lastInferMs * 0.8)) return null;
+  if (performance.now() - lastInterimAt < Math.max(600, lastInterimMs * 0.8)) return null;
   return seg.peekInterim();
 }
 
@@ -1746,8 +1762,8 @@ async function runCommit(job, epoch) {
 
 async function runInterim(it, epoch) {
   const t0 = performance.now();
-  const out = await asrRun(prepAudio(it.audio), decodeOpts(it.audio.length / ASR_SR));
-  lastInferMs = performance.now() - t0;
+  const out = await asrRun(prepAudio(it.audio), decodeOpts(it.audio.length / ASR_SR), true);   // small model → fast preview
+  lastInterimMs = performance.now() - t0;
   lastInterimAt = performance.now();
   if (epoch !== sessionEpoch) return;
   if (out.error) throw new Error(out.error);
