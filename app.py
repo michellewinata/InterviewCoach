@@ -26,7 +26,7 @@ HTML = r"""
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="InterviewCoach - Practice interviews with local open-source Whisper transcription, filler word detection and performance reports." />
+<meta name="description" content="InterviewCoach - Practice interviews with local Whisper Large-v3-Turbo transcription, filler word detection and performance reports." />
 <title>InterviewCoach</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1551,7 +1551,6 @@ function __asrWorkerMain() {
         await asr(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, a.english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
         cur = Object.assign({ i }, a);
         post({ type: 'ready', loadId, lang, info: { label: a.label, device: a.device, english: a.english } });
-        if (a.device !== 'webgpu') loadFast(a.english);        // background: small model for instant live preview
         return true;
       } catch (err) {
         console.warn('ASR attempt failed:', a.label, err);
@@ -1559,18 +1558,6 @@ function __asrWorkerMain() {
       }
     }
     return false;
-  }
-
-  async function loadFast(english) {
-    const myLang = lang;
-    try {
-      const model = english ? 'onnx-community/whisper-tiny.en' : 'onnx-community/whisper-base';
-      const p = await tf.pipeline('automatic-speech-recognition', model, { device: 'wasm', dtype: 'q8' });
-      if (myLang !== lang) return;                                   // language changed meanwhile
-      await p(new Float32Array(16000), Object.assign({ max_new_tokens: 4 }, english ? {} : { language: lang === 'id' ? 'indonesian' : 'english', task: 'transcribe' }));
-      fast = p;
-      post({ type: 'fastready', label: model.split('/').pop() });
-    } catch (err) { console.warn('fast preview model unavailable:', err); fast = null; }
   }
 
   self.onmessage = (e) => {
@@ -1615,24 +1602,22 @@ async function detectWebGPU() {
 }
 
 function buildAttempts(lang, gpu) {
+  // Use Whisper Large-v3-Turbo for BOTH English and Indonesian.
+  // Do not silently switch to a smaller model; only the execution backend changes.
   const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
-  const mk = (model, device, dtype, english) => ({
-    model, device, dtype, english,
-    label: 'Whisper ' + model.split('/').pop().replace(/^whisper-|^distil-/, (m) => m === 'distil-' ? 'distil ' : '') +
-           (device === 'webgpu' ? ' · WebGPU' : ' · CPU')
-  });
-  const list = [];
-  if (lang === 'en') {
-    if (gpu) {
-      list.push(mk('onnx-community/distil-small.en', 'webgpu', gpuDtype, true));   // ≈ small.en accuracy, much faster
-      list.push(mk('onnx-community/whisper-small.en', 'webgpu', gpuDtype, true));
-    }
-    list.push(mk('onnx-community/whisper-base.en', 'wasm', 'q8', true));
-  } else {
-    if (gpu) list.push(mk('onnx-community/whisper-small', 'webgpu', gpuDtype, false));
-    list.push(mk('onnx-community/whisper-small', 'wasm', 'q8', false));
+  const model = 'onnx-community/whisper-large-v3-turbo';
+  const attempts = [];
+  if (gpu) {
+    attempts.push({
+      model, device: 'webgpu', dtype: gpuDtype, english: false,
+      label: 'Whisper Large-v3-Turbo · WebGPU'
+    });
   }
-  return list;
+  attempts.push({
+    model, device: 'wasm', dtype: 'q8', english: false,
+    label: 'Whisper Large-v3-Turbo · CPU'
+  });
+  return attempts;
 }
 
 // ─── worker plumbing ───
@@ -1723,7 +1708,7 @@ function prepAudio(a) {
 function decodeOpts(sec) {
   // token cap ≈ speaking speed × duration: stops runaway repetition loops, saves time
   const o = { max_new_tokens: Math.min(400, Math.ceil(sec * 10) + 24) };
-  if (!asrInfo || !asrInfo.english) { o.language = currentLang === 'id' ? 'indonesian' : 'english'; o.task = 'transcribe'; }
+  o.language = currentLang === 'id' ? 'indonesian' : 'english'; o.task = 'transcribe';
   return o;
 }
 
@@ -1762,7 +1747,7 @@ async function runCommit(job, epoch) {
 
 async function runInterim(it, epoch) {
   const t0 = performance.now();
-  const out = await asrRun(prepAudio(it.audio), decodeOpts(it.audio.length / ASR_SR), true);   // small model → fast preview
+  const out = await asrRun(prepAudio(it.audio), decodeOpts(it.audio.length / ASR_SR), true);   // Whisper Large-v3-Turbo live preview
   lastInterimMs = performance.now() - t0;
   lastInterimAt = performance.now();
   if (epoch !== sessionEpoch) return;
