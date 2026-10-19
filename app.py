@@ -8,7 +8,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Hide Streamlit default chrome for a full custom UI experience
+# Sembunyikan default header/footer Streamlit
 st.markdown("""
 <style>
     #MainMenu, header, footer { visibility: hidden; }
@@ -18,7 +18,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FULL APP HTML / CSS / JS (Client-side ONNX Whisper - English & Indonesian)
+#  APP HTML / CSS / JS WITH WHISPER-SMALL (ONNX Transformers.js)
 # ─────────────────────────────────────────────────────────────────────────────
 HTML = r"""
 <!DOCTYPE html>
@@ -318,7 +318,6 @@ html, body {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 10px; color: #90a4ae; font-size: 0.88rem; pointer-events: none;
 }
-.transcript-interim { color: var(--clr-interim); font-style: italic; }
 
 .live-metrics { display: flex; gap: 10px; margin-top: 12px; }
 .live-metric {
@@ -487,7 +486,6 @@ html, body {
             <span id="label-placeholder">Press Start and begin speaking…</span>
           </div>
           <span id="final-text"></span>
-          <span class="transcript-interim" id="interim-text"></span>
         </div>
 
         <div class="live-metrics">
@@ -694,9 +692,8 @@ let currentMode = 'free';
 let currentQuestion = '';
 let sessionStartTime = null;
 let sessionTimerInterval = null;
-let finalCleanTranscript = ''; // Clean transcript WITHOUT pause markers for live view
-let pauseMarkers = [];         // Records pause markers: {index, type: '/' | '//'}
-let transcriptChunks = [];     // [{text: string, gapBefore: number}]
+let finalCleanTranscript = ''; 
+let transcriptChunks = [];     
 let fillerCountLive = 0;
 let pauses = [];
 let sessionDuration = 0;
@@ -814,7 +811,7 @@ class Segmenter {
       return;
     }
     const silence = this.nFrames * FRAME_SEC - this.lastSpeechEndT;
-    if (silence >= 0.6 || dur >= 10.0) {
+    if (silence >= 0.6 || dur >= 9.0) {
       this._emit();
     }
   }
@@ -835,7 +832,7 @@ class Segmenter {
   }
 }
 
-// ── Web Worker for Whisper Transformers.js ──
+// ── Web Worker for Whisper-Small ──
 const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3';
 
 function __asrWorkerMain() {
@@ -848,13 +845,19 @@ function __asrWorkerMain() {
         tf.env.allowLocalModels = false;
         tf.env.useBrowserCache = true;
         curLang = m.lang;
-        self.postMessage({ type: 'status', text: 'Loading Whisper model (~39MB)...' });
-        // Use whisper-tiny: fast, multilingual (EN + ID supported natively)
-        asr = await tf.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny', {
-          device: m.device,
-          dtype: 'q8'
+        self.postMessage({ type: 'status', text: 'Loading Whisper-Small (~240MB)...' });
+        
+        // Pilihan device: webgpu jika ada, jika tidak fallback ke wasm
+        let device = 'wasm';
+        try {
+          if (navigator.gpu && await navigator.gpu.requestAdapter()) device = 'webgpu';
+        } catch (_) {}
+
+        asr = await tf.pipeline('automatic-speech-recognition', 'onnx-community/whisper-small', {
+          device: device,
+          dtype: device === 'webgpu' ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8'
         });
-        self.postMessage({ type: 'ready', lang: m.lang });
+        self.postMessage({ type: 'ready', lang: m.lang, device: device });
       } catch (err) {
         self.postMessage({ type: 'loaderror', message: err.message });
       }
@@ -863,7 +866,7 @@ function __asrWorkerMain() {
         const out = await asr(m.audio, {
           language: m.lang === 'id' ? 'indonesian' : 'english',
           task: 'transcribe',
-          max_new_tokens: 120
+          max_new_tokens: 150
         });
         self.postMessage({ type: 'result', id: m.id, text: out.text || '' });
       } catch (err) {
@@ -883,7 +886,7 @@ function initAsrWorker(lang) {
     const m = e.data;
     if (m.type === 'ready') {
       asrReady = true;
-      setStatus('idle', 'Model ready (Whisper ONNX)');
+      setStatus('idle', `Model ready (Whisper-Small · ${m.device.toUpperCase()})`);
     } else if (m.type === 'status') {
       setStatus('analyzing', m.text);
     } else if (m.type === 'result') {
@@ -892,7 +895,7 @@ function initAsrWorker(lang) {
       setStatus('idle', 'Model load error');
     }
   };
-  asrWorker.postMessage({ type: 'load', cdn: TRANSFORMERS_CDN, lang: lang, device: 'wasm' });
+  asrWorker.postMessage({ type: 'load', cdn: TRANSFORMERS_CDN, lang: lang });
 }
 
 function runAsr(audio, lang) {
@@ -916,7 +919,6 @@ async function startSession() {
   sessionDuration = 0;
 
   document.getElementById('final-text').textContent = '';
-  document.getElementById('interim-text').textContent = '';
   document.getElementById('transcript-placeholder').style.display = 'flex';
   document.getElementById('report-section').classList.remove('visible');
   document.getElementById('btn-start').disabled = true;
@@ -965,7 +967,7 @@ async function processQueue() {
   isProcessing = true;
   while (commitQueue.length) {
     const job = commitQueue.shift();
-    setStatus('recording', 'Transcribing phrase...');
+    setStatus('recording', 'Transcribing (Whisper-Small)...');
     const res = await runAsr(job.audio, currentLang);
     if (res && res.text) {
       let txt = res.text.trim();
@@ -1077,7 +1079,7 @@ function buildReport() {
   const keywords = extractKeywords(cleanText);
   const pauseTotal = Math.round(pauses.reduce((a,b)=>a+b.duration, 0) * 10)/10;
 
-  // Build final report transcript WITH pause markers inserted between chunks
+  // Pasang tanda jeda / dan // HANYA di Final Report
   let reportTranscript = '';
   transcriptChunks.forEach((c) => {
     if (c.gapBefore >= 3.0) reportTranscript += ' // ';
@@ -1085,7 +1087,6 @@ function buildReport() {
     reportTranscript += c.text + ' ';
   });
 
-  // Highlight fillers in final transcript
   let highlighted = reportTranscript.trim();
   highlighted = highlighted.replace(/ \/{2} /g, ' <span class="pause-marker long" title="Long pause (>3s)">//</span> ');
   highlighted = highlighted.replace(/ \/ /g, ' <span class="pause-marker short" title="Short pause (1.5-3s)">/</span> ');
@@ -1095,7 +1096,6 @@ function buildReport() {
     highlighted = highlighted.replace(regex, `<span class="filler-highlight">$1</span>`);
   });
 
-  // Render stats
   const stats = [
     { icon: '⏱️', val: formatTime(duration), lbl: currentLang==='en'?'Duration':'Durasi' },
     { icon: '💬', val: totalWords, lbl: currentLang==='en'?'Words':'Kata' },
