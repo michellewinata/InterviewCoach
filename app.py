@@ -404,7 +404,7 @@ html, body {
   <div class="header-right">
     <div class="lang-toggle">
       <button class="lang-btn active" id="lang-en" onclick="setLang('en')">🇬🇧 English (VOSK)</button>
-      <button class="lang-btn" id="lang-id" onclick="setLang('id')">🇮🇩 Indonesia (Whisper V3/Base)</button>
+      <button class="lang-btn" id="lang-id" onclick="setLang('id')">🇮🇩 Indonesia (Whisper V3-Turbo)</button>
     </div>
   </div>
 </header>
@@ -834,124 +834,127 @@ class Segmenter {
   }
 }
 
-// ── Web Worker for Whisper Transformers.js (Indonesian V3-Turbo -> Fallback Base) ──
+// ── One multilingual Whisper Large-v3-Turbo worker for BOTH languages ──
 const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3';
+const WHISPER_V3_MODEL = 'onnx-community/whisper-large-v3-turbo';
 
 function __asrWorkerMain() {
   let asr = null, tf = null, curModel = '';
   self.onmessage = async (e) => {
     const m = e.data;
+
     if (m.type === 'load') {
       try {
         if (!tf) tf = await import(m.cdn);
         tf.env.allowLocalModels = false;
         tf.env.useBrowserCache = true;
-        
-        let loaded = false;
-        let device = 'wasm';
-        try {
-          if (navigator.gpu && await navigator.gpu.requestAdapter()) device = 'webgpu';
-        } catch (_) {}
 
-        // 1. Coba Whisper Large-v3-Turbo di WebGPU terlebih dahulu
-        if (device === 'webgpu') {
-          try {
+        let loaded = false;
+        // Prefer WebGPU when the browser and device support it.
+        try {
+          const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+          if (adapter) {
             self.postMessage({ type: 'status', text: 'Loading Whisper Large-v3-Turbo (WebGPU)...' });
-            asr = await tf.pipeline('automatic-speech-recognition', 'onnx-community/whisper-large-v3-turbo', {
+            asr = await tf.pipeline('automatic-speech-recognition', m.model, {
               device: 'webgpu',
               dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' }
             });
-            curModel = 'Whisper Large-v3-Turbo · WEBGPU';
+            curModel = 'Whisper Large-v3-Turbo · WebGPU';
             loaded = true;
-          } catch (errGpu) {
-            console.warn('WebGPU Large-v3-turbo failed, falling back to base model...', errGpu);
           }
+        } catch (gpuErr) {
+          console.warn('Whisper V3 WebGPU load failed; trying WASM with the same model.', gpuErr);
+          asr = null;
         }
 
-        // 2. Fallback ke Whisper-Base jika WebGPU gagal atau tidak ada GPU
+        // Same V3-Turbo model on WASM; this can be slow and memory-heavy on some devices.
         if (!loaded) {
-          self.postMessage({ type: 'status', text: 'Loading Whisper-Base (Fallback WASM)...' });
-          asr = await tf.pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
+          self.postMessage({ type: 'status', text: 'Loading Whisper Large-v3-Turbo (WASM fallback)...' });
+          asr = await tf.pipeline('automatic-speech-recognition', m.model, {
             device: 'wasm',
             dtype: 'q8'
           });
-          curModel = 'Whisper-Base · WASM (Fallback)';
+          curModel = 'Whisper Large-v3-Turbo · WASM';
         }
 
         self.postMessage({ type: 'ready', modelLabel: curModel });
       } catch (err) {
-        self.postMessage({ type: 'loaderror', message: err.message });
+        self.postMessage({ type: 'loaderror', message: err?.message || String(err) });
       }
-    } else if (m.type === 'run') {
+      return;
+    }
+
+    if (m.type === 'run') {
       try {
+        if (!asr) throw new Error('Whisper model has not finished loading.');
         const out = await asr(m.audio, {
-          language: 'indonesian',
+          language: m.language,
           task: 'transcribe',
-          max_new_tokens: 150
+          max_new_tokens: 128
         });
         self.postMessage({ type: 'result', id: m.id, text: out.text || '' });
       } catch (err) {
-        self.postMessage({ type: 'result', id: m.id, error: err.message });
+        self.postMessage({ type: 'result', id: m.id, error: err?.message || String(err) });
       }
     }
   };
 }
 
-let asrWorker = null, asrReady = false, asrRunSeq = 0, asrWaiters = {};
-let voskSocket = null;
+let asrWorker = null, asrReady = false, asrLoading = false, asrRunSeq = 0, asrWaiters = {};
 
 function initAsrWorker() {
+  if (asrReady || asrLoading) return;
   if (asrWorker) asrWorker.terminate();
+
+  asrReady = false;
+  asrLoading = true;
   const blob = new Blob(['(' + __asrWorkerMain.toString() + ')();'], { type: 'text/javascript' });
-  asrWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+  const workerUrl = URL.createObjectURL(blob);
+  asrWorker = new Worker(workerUrl, { type: 'module' });
   asrWorker.onmessage = (e) => {
     const m = e.data;
     if (m.type === 'ready') {
       asrReady = true;
+      asrLoading = false;
       setStatus('idle', `Model ready (${m.modelLabel})`);
     } else if (m.type === 'status') {
       setStatus('analyzing', m.text);
     } else if (m.type === 'result') {
-      if (asrWaiters[m.id]) { asrWaiters[m.id](m); delete asrWaiters[m.id]; }
+      if (asrWaiters[m.id]) {
+        asrWaiters[m.id](m);
+        delete asrWaiters[m.id];
+      }
     } else if (m.type === 'loaderror') {
-      setStatus('idle', 'Model error, fallback to standard');
+      asrReady = false;
+      asrLoading = false;
+      console.error('Whisper V3 model loading failed:', m.message);
+      setStatus('idle', `Whisper V3 failed: ${m.message}`);
     }
   };
-  asrWorker.postMessage({ type: 'load', cdn: TRANSFORMERS_CDN });
+  asrWorker.onerror = (err) => {
+    asrReady = false;
+    asrLoading = false;
+    console.error('Whisper worker error:', err);
+    setStatus('idle', 'Whisper worker failed. Check browser console.');
+  };
+  asrWorker.postMessage({ type: 'load', cdn: TRANSFORMERS_CDN, model: WHISPER_V3_MODEL });
 }
 
 function runAsrWhisper(audio) {
   return new Promise((resolve) => {
+    if (!asrWorker || !asrReady) {
+      resolve({ error: 'Whisper Large-v3-Turbo is not ready yet.' });
+      return;
+    }
     const id = ++asrRunSeq;
     asrWaiters[id] = resolve;
-    asrWorker.postMessage({ type: 'run', id, audio }, [audio.buffer]);
+    asrWorker.postMessage({
+      type: 'run',
+      id,
+      audio,
+      language: currentLang === 'en' ? 'english' : 'indonesian'
+    }, [audio.buffer]);
   });
-}
-
-// ── VOSK WebSocket Setup (English) ──
-function connectVosk() {
-  if (voskSocket && voskSocket.readyState === WebSocket.OPEN) return;
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  voskSocket = new WebSocket(`${proto}://${location.host}/ws/en`);
-  voskSocket.onopen = () => {
-    if (currentLang === 'en') setStatus('idle', 'VOSK Local ASR Connected');
-  };
-  voskSocket.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'final' && msg.text) {
-        transcriptChunks.push({ text: msg.text, gapBefore: 0 });
-        finalCleanTranscript += (finalCleanTranscript ? ' ' : '') + msg.text;
-        document.getElementById('transcript-placeholder').style.display = 'none';
-        document.getElementById('final-text').textContent = finalCleanTranscript;
-        document.getElementById('transcript-area').scrollTop = document.getElementById('transcript-area').scrollHeight;
-        updateLiveMetrics();
-      }
-    } catch (_) {}
-  };
-  voskSocket.onerror = () => {
-    if (currentLang === 'en') setStatus('idle', 'VOSK Ready');
-  };
 }
 
 function float32ToInt16(buffer) {
@@ -967,6 +970,13 @@ let seg = null, resampler = null, audioCtx = null, micStream = null, procNode = 
 let commitQueue = [], isProcessing = false;
 
 async function startSession() {
+  if (!asrWorker || !asrReady) {
+    initAsrWorker();
+    setStatus('idle', asrLoading ? 'Whisper Large-v3-Turbo is loading. Please wait.' : 'Whisper is not ready; check the model loading error.');
+    document.getElementById('btn-start').disabled = false;
+    return;
+  }
+
   seg = new Segmenter();
   commitQueue = [];
   finalCleanTranscript = '';
@@ -991,19 +1001,12 @@ async function startSession() {
       if (!sessionActive) return;
       const f32 = resampler.process(e.inputBuffer.getChannelData(0));
 
-      if (currentLang === 'en') {
-        // EN: Stream langsung ke VOSK Backend via WebSocket
-        if (voskSocket && voskSocket.readyState === WebSocket.OPEN) {
-          voskSocket.send(float32ToInt16(f32).buffer);
-        }
-      } else {
-        // ID: Gunakan Segmenter lokal dan kirim ke Whisper Large-V3/Base
-        seg.push(f32);
-        const c = seg.takeCommits();
-        if (c.length) {
-          commitQueue.push(...c);
-          processQueueWhisper();
-        }
+      // Both English and Indonesian use the same multilingual Whisper V3-Turbo model.
+      seg.push(f32);
+      const c = seg.takeCommits();
+      if (c.length) {
+        commitQueue.push(...c);
+        processQueueWhisper();
       }
     };
 
@@ -1021,8 +1024,7 @@ async function startSession() {
       updateLiveMetrics();
     }, 500);
 
-    const modelName = currentLang === 'en' ? 'VOSK Local' : 'Whisper V3/Base';
-    setStatus('recording', `Listening (${modelName})...`);
+    setStatus('recording', `Listening (Whisper Large-v3-Turbo · ${currentLang === 'en' ? 'English' : 'Indonesian'})...`);
     document.getElementById('btn-stop').disabled = false;
   } catch (err) {
     console.error(err);
@@ -1034,12 +1036,17 @@ async function startSession() {
 async function processQueueWhisper() {
   if (isProcessing || !commitQueue.length) return;
   isProcessing = true;
-  while (commitQueue.length) {
-    const job = commitQueue.shift();
-    setStatus('recording', 'Transcribing (Whisper V3)...');
-    const res = await runAsrWhisper(job.audio);
-    if (res && res.text) {
-      let txt = res.text.trim();
+  try {
+    while (commitQueue.length) {
+      const job = commitQueue.shift();
+      setStatus('analyzing', `Transcribing with Whisper V3-Turbo (${currentLang === 'en' ? 'English' : 'Indonesian'})...`);
+      const res = await runAsrWhisper(job.audio);
+      if (res?.error) {
+        console.error('Whisper transcription error:', res.error);
+        setStatus('idle', `Whisper transcription error: ${res.error}`);
+        continue;
+      }
+      const txt = (res?.text || '').trim();
       if (txt) {
         transcriptChunks.push({ text: txt, gapBefore: job.pauseBefore });
         finalCleanTranscript += (finalCleanTranscript ? ' ' : '') + txt;
@@ -1050,9 +1057,13 @@ async function processQueueWhisper() {
         updateLiveMetrics();
       }
     }
+  } catch (err) {
+    console.error('Whisper queue failed:', err);
+    setStatus('idle', `Whisper error: ${err?.message || String(err)}`);
+  } finally {
+    isProcessing = false;
+    if (sessionActive && asrReady) setStatus('recording', 'Listening with Whisper Large-v3-Turbo...');
   }
-  isProcessing = false;
-  if (sessionActive) setStatus('recording', 'Listening (Whisper V3)...');
 }
 
 async function stopSession() {
@@ -1065,7 +1076,7 @@ async function stopSession() {
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
 
   setStatus('analyzing', 'Finishing report...');
-  if (currentLang === 'id' && seg) {
+  if (seg) {
     commitQueue.push(...seg.flush());
     await processQueueWhisper();
   }
@@ -1223,11 +1234,10 @@ function setLang(lang) {
   populateQuestions();
   applyLabels();
   
-  if (lang === 'en') {
-    connectVosk();
-    setStatus('idle', 'English VOSK Ready');
-  } else {
-    initAsrWorker();
+  // The same multilingual Whisper V3-Turbo model handles both languages.
+  initAsrWorker();
+  if (asrReady) {
+    setStatus('idle', `Whisper Large-v3-Turbo ready (${lang === 'en' ? 'English' : 'Indonesian'})`);
   }
 }
 
@@ -1308,7 +1318,7 @@ function setStatus(st, meta='') {
 // Inisialisasi awal
 populateQuestions();
 applyLabels();
-connectVosk();
+initAsrWorker();
 </script>
 </body>
 </html>
