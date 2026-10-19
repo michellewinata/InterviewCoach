@@ -26,7 +26,7 @@ HTML = r"""
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="InterviewCoach - Practice interviews with local open-source Whisper transcription, filler word detection and performance reports." />
+<meta name="description" content="InterviewCoach - Practice interviews with local Whisper large-v3-turbo transcription, filler word detection and performance reports." />
 <title>InterviewCoach</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1615,6 +1615,8 @@ async function detectWebGPU() {
 }
 
 function buildAttempts(lang, gpu) {
+  // Prefer multilingual Whisper large-v3-turbo on WebGPU for English and Indonesian.
+  // Smaller models remain as fallbacks for devices/browsers that cannot load it.
   const gpuDtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
   const mk = (model, device, dtype, english) => ({
     model, device, dtype, english,
@@ -1622,10 +1624,15 @@ function buildAttempts(lang, gpu) {
            (device === 'webgpu' ? ' · WebGPU' : ' · CPU')
   });
   const list = [];
+
+  if (gpu) {
+    list.push(mk('onnx-community/whisper-large-v3-turbo', 'webgpu', gpuDtype, false));
+  }
+
   if (lang === 'en') {
     if (gpu) {
-      list.push(mk('onnx-community/distil-small.en', 'webgpu', gpuDtype, true));   // ≈ small.en accuracy, much faster
       list.push(mk('onnx-community/whisper-small.en', 'webgpu', gpuDtype, true));
+      list.push(mk('onnx-community/distil-small.en', 'webgpu', gpuDtype, true));
     }
     list.push(mk('onnx-community/whisper-base.en', 'wasm', 'q8', true));
   } else {
