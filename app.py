@@ -8,6 +8,8 @@ import time
 import wave
 import random
 import tempfile
+import threading
+import queue
 import logging
 from pathlib import Path
 from typing import Optional, List
@@ -24,6 +26,21 @@ from model_manager import ModelManager, numpy_to_wav
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Audio library detection
+# ---------------------------------------------------------------------------
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -201,13 +218,17 @@ def init_session_state():
         "session_mode": "Practice Mode",
         "selected_q_idx": 0,
         "current_question": QUESTIONS_EN[0],
+        "recording": False,
+        "recorded_frames": [],
+        "live_text": "",
         "final_text": "",
         "analysis_result": None,
+        "start_time": None,
         "audio_path": None,
         "model_manager": None,
-        "audio_key": 0,            # bump to reset the st.audio_input widget
-        "processed_hash": None,    # avoid re-analysing the same recording
-        "used_model": "",
+        "audio_thread": None,
+        "audio_queue": None,
+        "stop_event": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -223,62 +244,139 @@ def get_model_manager() -> ModelManager:
     return ModelManager()
 
 # ===========================================================================
-# Audio helpers (audio is recorded in the USER'S BROWSER via st.audio_input)
+# Audio recording helpers
 # ===========================================================================
 SAMPLE_RATE = 16000
+CHUNK_SIZE  = 1024
+
+def _record_sounddevice(frames_list, stop_event, live_q, vosk_lang, mm):
+    import sounddevice as _sd
+    live_parts = []
+
+    def callback(indata, frames, t, status):
+        if stop_event.is_set():
+            raise _sd.CallbackStop()
+        pcm = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+        frames_list.append(indata[:, 0].copy())
+        if mm.vosk_en or mm.vosk_id:
+            txt, is_final = mm.transcribe_live_chunk(pcm, vosk_lang)
+            if txt:
+                if is_final:
+                    live_parts.append(txt)
+                live_q.put((" ".join(live_parts) + " " + txt).strip())
+
+    with _sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                         dtype="float32", blocksize=CHUNK_SIZE,
+                         callback=callback):
+        stop_event.wait()
+
+    # Flush
+    if mm.vosk_en or mm.vosk_id:
+        v = mm.vosk_en if vosk_lang == "en" else mm.vosk_id
+        if v and v.recognizer:
+            res = json.loads(v.recognizer.FinalResult())
+            last = res.get("text", "")
+            if last:
+                live_parts.append(last)
+            live_q.put(" ".join(live_parts).strip())
 
 
-def wav_bytes_to_mono16k(data: bytes) -> np.ndarray:
-    """Decode WAV bytes from st.audio_input -> float32 mono @ 16 kHz."""
-    with wave.open(io.BytesIO(data), "rb") as wf:
-        channels = wf.getnchannels()
-        width    = wf.getsampwidth()
-        rate     = wf.getframerate()
-        raw      = wf.readframes(wf.getnframes())
-    if width != 2:
-        raise ValueError(f"Unsupported WAV sample width: {width * 8}-bit")
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    if channels > 1:
-        audio = audio[: len(audio) - len(audio) % channels].reshape(-1, channels).mean(axis=1)
-    if rate != SAMPLE_RATE and len(audio) > 1:
-        n_out = int(len(audio) * SAMPLE_RATE / rate)
-        audio = np.interp(np.linspace(0, len(audio) - 1, n_out),
-                          np.arange(len(audio)), audio).astype(np.float32)
-    return audio
+def _record_pyaudio(frames_list, stop_event, live_q, vosk_lang, mm):
+    import pyaudio as _pa
+    pa = _pa.PyAudio()
+    stream = pa.open(format=_pa.paInt16, channels=1, rate=SAMPLE_RATE,
+                     input=True, frames_per_buffer=CHUNK_SIZE)
+    live_parts = []
+    try:
+        while not stop_event.is_set():
+            pcm = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            frames_list.append(arr)
+            if mm.vosk_en or mm.vosk_id:
+                txt, is_final = mm.transcribe_live_chunk(pcm, vosk_lang)
+                if txt:
+                    if is_final:
+                        live_parts.append(txt)
+                    live_q.put((" ".join(live_parts) + " " + txt).strip())
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+
+    # Flush
+    if mm.vosk_en or mm.vosk_id:
+        v = mm.vosk_en if vosk_lang == "en" else mm.vosk_id
+        if v and v.recognizer:
+            res = json.loads(v.recognizer.FinalResult())
+            last = res.get("text", "")
+            if last:
+                live_parts.append(last)
+            live_q.put(" ".join(live_parts).strip())
 
 
-def process_recording(wav_bytes: bytes):
-    """Transcribe + analyse one recording and store results in session state."""
-    mm   = st.session_state.model_manager
+def start_recording():
+    mm = st.session_state.model_manager
     lang = st.session_state.language
-
-    audio    = wav_bytes_to_mono16k(wav_bytes)
-    duration = len(audio) / SAMPLE_RATE
-    if duration < 1.0:
-        st.warning("Recording too short - please speak for at least a few seconds.")
+    if mm is None:
+        st.error("Load models first from sidebar.")
         return
 
-    wav_path = numpy_to_wav(audio, SAMPLE_RATE)
+    frames = []
+    q = queue.Queue()
+    stop_ev = threading.Event()
+    mm.reset_live(lang)
+
+    if SOUNDDEVICE_AVAILABLE:
+        t = threading.Thread(target=_record_sounddevice,
+                             args=(frames, stop_ev, q, lang, mm), daemon=True)
+    elif PYAUDIO_AVAILABLE:
+        t = threading.Thread(target=_record_pyaudio,
+                             args=(frames, stop_ev, q, lang, mm), daemon=True)
+    else:
+        st.error("Install sounddevice or pyaudio: pip install sounddevice")
+        return
+
+    st.session_state.recorded_frames = frames
+    st.session_state.audio_queue     = q
+    st.session_state.stop_event      = stop_ev
+    st.session_state.audio_thread    = t
+    st.session_state.start_time      = time.time()
+    st.session_state.live_text       = ""
+    st.session_state.recording       = True
+    st.session_state.analysis_result = None
+    t.start()
+
+
+def stop_recording():
+    if st.session_state.stop_event:
+        st.session_state.stop_event.set()
+    if st.session_state.audio_thread:
+        st.session_state.audio_thread.join(timeout=5)
+    st.session_state.recording = False
+
+    frames   = st.session_state.recorded_frames
+    duration = time.time() - (st.session_state.start_time or time.time())
+
+    if not frames:
+        st.warning("No audio recorded.")
+        return
+
+    audio_data = np.concatenate(frames).astype(np.float32)
+    wav_path   = numpy_to_wav(audio_data, SAMPLE_RATE)
     st.session_state.audio_path = wav_path
 
-    # Prefer Whisper (works for EN + ID). Load it on demand.
-    if not (mm.whisper and mm.whisper.model):
-        with st.spinner("Loading Whisper model (first time only)..."):
-            mm.load_whisper("base")
+    # Final transcription
+    mm   = st.session_state.model_manager
+    lang = st.session_state.language
+    result     = mm.transcribe_final(wav_path, lang)
+    final_text = result.get("text", "") or st.session_state.live_text
 
-    with st.spinner("Transcribing..."):
-        result = mm.transcribe_final(wav_path, lang)
+    st.session_state.final_text = final_text
 
-    text = (result.get("text") or "").strip()
-    st.session_state.used_model = result.get("model_used", "none")
-    if not text:
-        st.error("Could not transcribe the audio. Try again, speak closer to the mic, "
-                 "or check that Whisper loaded in the sidebar.")
-        return
-
-    st.session_state.final_text = text
+    # Analysis
     analyzer = SpeechAnalyzer(lang)
-    st.session_state.analysis_result = analyzer.analyze_full(text, audio, duration, SAMPLE_RATE)
+    analysis = analyzer.analyze_full(final_text, audio_data, duration, SAMPLE_RATE)
+    st.session_state.analysis_result = analysis
 
 
 # ===========================================================================
@@ -297,8 +395,9 @@ def render_sidebar():
             st.session_state.language = new_lang
             st.session_state.selected_q_idx = 0
             st.session_state.analysis_result = None
+            st.session_state.live_text = ""
             st.session_state.final_text = ""
-            st.rerun()
+            st.experimental_rerun()
 
         st.divider()
 
@@ -324,6 +423,7 @@ def render_sidebar():
                 st.session_state.selected_q_idx   = idx
                 st.session_state.current_question = q_list[idx]
                 st.session_state.analysis_result  = None
+                st.session_state.live_text        = ""
             st.caption(f"Q#{st.session_state.selected_q_idx + 1} selected")
 
         st.divider()
@@ -337,16 +437,15 @@ def render_sidebar():
             st.markdown(f"{'✅' if ok else '❌'} **{name.capitalize()}**")
 
         st.divider()
-        if st.button("▶ Load Whisper (recommended)", use_container_width=True):
-            with st.spinner("Loading Whisper-base..."):
+        if st.button("▶ Load Vosk (live)", use_container_width=True):
+            with st.spinner("Downloading / loading Vosk…"):
+                ok = mm.load_vosk(st.session_state.language)
+            st.success("Vosk loaded ✅") if ok else st.error("Vosk failed ❌")
+
+        if st.button("▶ Load Whisper (final)", use_container_width=True):
+            with st.spinner("Loading Whisper-base…"):
                 ok = mm.load_whisper("base")
             st.success("Whisper loaded ✅") if ok else st.error("Whisper failed ❌")
-
-        if st.session_state.language == "en":
-            if st.button("▶ Load Vosk (EN fallback)", use_container_width=True):
-                with st.spinner("Downloading / loading Vosk small..."):
-                    ok = mm.load_vosk("en")
-                st.success("Vosk loaded ✅") if ok else st.error("Vosk failed ❌")
 
         st.divider()
         st.caption(f"Best model: **{mm.best_model}**")
@@ -378,8 +477,8 @@ def render_results():
         st.markdown(f"""
 | Type | Count | Marker |
 |------|-------|--------|
-| Short pause (0.5–1.5s) | **{r['pauses_short']}** | `\\|` |
-| Long pause  (>1.5s)    | **{r['pauses_long']}**  | `\\|\\|` |
+| Short pause (0.5–1.5s) | **{r['pauses_short']}** | `\|` |
+| Long pause  (>1.5s)    | **{r['pauses_long']}**  | `\|\|` |
 """)
         st.markdown("### 🔑 Keywords Found")
         kw = r['keywords_found']
@@ -475,30 +574,52 @@ def render_main():
             unsafe_allow_html=True,
         )
 
-    # Recorder (runs in the browser, so it works on Streamlit Cloud)
-    st.markdown("### 🎙️ Record your answer")
-    st.caption("Click the mic, speak, then press stop. Analysis starts automatically.")
-    audio = st.audio_input("Your answer", key=f"audio_{st.session_state.audio_key}",
-                           label_visibility="collapsed")
+    # Controls
+    c1, c2, _ = st.columns([2, 2, 4])
+    mm = st.session_state.model_manager
+    if mm is None:
+        st.warning("⚠️ Click **▶ Load Vosk** in the sidebar first.")
+        return
 
-    if audio is not None:
-        data = audio.getvalue()
-        h = hash(data)
-        if h != st.session_state.processed_hash:
-            st.session_state.processed_hash = h
-            try:
-                process_recording(data)
-            except Exception as e:
-                logger.exception("Processing failed")
-                st.error(f"Could not process the recording: {e}")
+    with c1:
+        if not st.session_state.recording:
+            if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
+                start_recording()
+                st.experimental_rerun()
+        else:
+            if st.button("⏹️ Stop & Analyze", use_container_width=True):
+                stop_recording()
+                st.experimental_rerun()
 
-    if st.button("🗑️ Clear", use_container_width=False):
-        st.session_state.analysis_result = None
-        st.session_state.final_text      = ""
-        st.session_state.audio_path      = None
-        st.session_state.processed_hash  = None
-        st.session_state.audio_key      += 1
-        st.rerun()
+    with c2:
+        if st.button("🗑️ Clear", use_container_width=True):
+            for key in ("analysis_result", "live_text", "final_text",
+                        "recorded_frames", "audio_path"):
+                st.session_state[key] = None if key in ("analysis_result", "audio_path") else ([] if key == "recorded_frames" else "")
+            st.experimental_rerun()
+
+    # Recording indicator + live update
+    if st.session_state.recording:
+        elapsed = time.time() - (st.session_state.start_time or time.time())
+        st.markdown(
+            f"<div style='color:#ef4444;font-weight:bold;padding:8px 0;'>"
+            f"🔴 Recording… {elapsed:.0f}s — speak now!</div>",
+            unsafe_allow_html=True,
+        )
+        # Drain live queue
+        q_obj = st.session_state.audio_queue
+        if q_obj:
+            while not q_obj.empty():
+                st.session_state.live_text = q_obj.get_nowait()
+        time.sleep(0.4)
+        st.experimental_rerun()
+
+    st.divider()
+
+    # Live transcript panel
+    st.markdown("### 📝 Live Transcription")
+    live_txt = st.session_state.live_text or "_Transcription appears here as you speak…_"
+    st.markdown(f"<div class='live-box'>{live_txt}</div>", unsafe_allow_html=True)
 
     # Results
     if st.session_state.analysis_result:
