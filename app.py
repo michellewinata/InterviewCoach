@@ -1,16 +1,18 @@
 # app.py - InterviewCoach Streamlit Application
-# Browser recording + best-model transcription + speech analysis
+# 2 languages, 50 questions each, live transcription (Vosk), final analysis (Whisper)
 
 import os
 import io
 import json
 import time
+import wave
 import random
 import tempfile
+import threading
+import queue
 import logging
-from typing import List
-
-import soundfile as sf
+from pathlib import Path
+from typing import Optional, List
 
 import numpy as np
 import streamlit as st
@@ -26,10 +28,19 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Audio recording
+# Audio library detection
 # ---------------------------------------------------------------------------
-# Streamlit Cloud cannot access the user's microphone through sounddevice or
-# pyaudio. Recording is handled by the user's browser with st.audio_input().
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -207,10 +218,17 @@ def init_session_state():
         "session_mode": "Practice Mode",
         "selected_q_idx": 0,
         "current_question": QUESTIONS_EN[0],
+        "recording": False,
+        "recorded_frames": [],
+        "live_text": "",
         "final_text": "",
         "analysis_result": None,
+        "start_time": None,
         "audio_path": None,
         "model_manager": None,
+        "audio_thread": None,
+        "audio_queue": None,
+        "stop_event": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -226,111 +244,139 @@ def get_model_manager() -> ModelManager:
     return ModelManager()
 
 # ===========================================================================
-# Browser audio processing
+# Audio recording helpers
 # ===========================================================================
 SAMPLE_RATE = 16000
+CHUNK_SIZE  = 1024
+
+def _record_sounddevice(frames_list, stop_event, live_q, vosk_lang, mm):
+    import sounddevice as _sd
+    live_parts = []
+
+    def callback(indata, frames, t, status):
+        if stop_event.is_set():
+            raise _sd.CallbackStop()
+        pcm = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+        frames_list.append(indata[:, 0].copy())
+        if mm.vosk_en or mm.vosk_id:
+            txt, is_final = mm.transcribe_live_chunk(pcm, vosk_lang)
+            if txt:
+                if is_final:
+                    live_parts.append(txt)
+                live_q.put((" ".join(live_parts) + " " + txt).strip())
+
+    with _sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                         dtype="float32", blocksize=CHUNK_SIZE,
+                         callback=callback):
+        stop_event.wait()
+
+    # Flush
+    if mm.vosk_en or mm.vosk_id:
+        v = mm.vosk_en if vosk_lang == "en" else mm.vosk_id
+        if v and v.recognizer:
+            res = json.loads(v.recognizer.FinalResult())
+            last = res.get("text", "")
+            if last:
+                live_parts.append(last)
+            live_q.put(" ".join(live_parts).strip())
 
 
-def load_best_model(mm: ModelManager, language: str) -> bool:
-    """Load only the model selected as best in model_config.json."""
-    best = (mm.best_model or "whisper").lower()
-
-    if best == "whisper":
-        return mm.load_whisper("base")
-    if best == "wav2vec2":
-        return mm.load_wav2vec2(language)
-    if best == "speechbrain":
-        return mm.load_speechbrain()
-    if best == "vosk":
-        return mm.load_vosk(language)
-
-    st.error(f"Unknown best model: {best}")
-    return False
-
-
-def process_recording(audio_file):
-    """Transcribe browser-recorded audio with the selected best model."""
-    if audio_file is None:
-        st.warning("Please record your answer first.")
-        return
-
-    mm = st.session_state.model_manager
-    language = st.session_state.language
-
-    if mm is None:
-        st.error("Model Manager is not initialized.")
-        return
-
-    best = (mm.best_model or "whisper").lower()
-
+def _record_pyaudio(frames_list, stop_event, live_q, vosk_lang, mm):
+    import pyaudio as _pa
+    pa = _pa.PyAudio()
+    stream = pa.open(format=_pa.paInt16, channels=1, rate=SAMPLE_RATE,
+                     input=True, frames_per_buffer=CHUNK_SIZE)
+    live_parts = []
     try:
-        with st.spinner(f"Loading best model: {best}..."):
-            loaded = load_best_model(mm, language)
+        while not stop_event.is_set():
+            pcm = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            frames_list.append(arr)
+            if mm.vosk_en or mm.vosk_id:
+                txt, is_final = mm.transcribe_live_chunk(pcm, vosk_lang)
+                if txt:
+                    if is_final:
+                        live_parts.append(txt)
+                    live_q.put((" ".join(live_parts) + " " + txt).strip())
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
 
-        if not loaded:
-            st.error(
-                f"Could not load the selected model ({best}). "
-                "Check the deployment logs and model dependencies."
-            )
-            return
+    # Flush
+    if mm.vosk_en or mm.vosk_id:
+        v = mm.vosk_en if vosk_lang == "en" else mm.vosk_id
+        if v and v.recognizer:
+            res = json.loads(v.recognizer.FinalResult())
+            last = res.get("text", "")
+            if last:
+                live_parts.append(last)
+            live_q.put(" ".join(live_parts).strip())
 
-        # st.audio_input returns a browser-recorded audio file.
-        audio_bytes = audio_file.getvalue()
-        audio_data, sample_rate = sf.read(
-            io.BytesIO(audio_bytes),
-            dtype="float32"
-        )
 
-        # Convert stereo audio to mono for ASR and pause analysis.
-        if audio_data.ndim == 2:
-            audio_data = np.mean(audio_data, axis=1)
+def start_recording():
+    mm = st.session_state.model_manager
+    lang = st.session_state.language
+    if mm is None:
+        st.error("Load models first from sidebar.")
+        return
 
-        if audio_data.size == 0:
-            st.error("The recorded audio is empty. Please record again.")
-            return
+    frames = []
+    q = queue.Queue()
+    stop_ev = threading.Event()
+    mm.reset_live(lang)
 
-        duration = len(audio_data) / float(sample_rate)
+    if SOUNDDEVICE_AVAILABLE:
+        t = threading.Thread(target=_record_sounddevice,
+                             args=(frames, stop_ev, q, lang, mm), daemon=True)
+    elif PYAUDIO_AVAILABLE:
+        t = threading.Thread(target=_record_pyaudio,
+                             args=(frames, stop_ev, q, lang, mm), daemon=True)
+    else:
+        st.error("Install sounddevice or pyaudio: pip install sounddevice")
+        return
 
-        # The ASR models in model_manager expect 16 kHz audio.
-        if sample_rate != SAMPLE_RATE:
-            st.error(
-                f"Audio sample rate is {sample_rate} Hz, but this app expects "
-                f"{SAMPLE_RATE} Hz. Please record again using the app's "
-                "16 kHz microphone input."
-            )
-            return
+    st.session_state.recorded_frames = frames
+    st.session_state.audio_queue     = q
+    st.session_state.stop_event      = stop_ev
+    st.session_state.audio_thread    = t
+    st.session_state.start_time      = time.time()
+    st.session_state.live_text       = ""
+    st.session_state.recording       = True
+    st.session_state.analysis_result = None
+    t.start()
 
-        # Write a clean mono WAV for the ASR model.
-        wav_path = numpy_to_wav(audio_data.astype(np.float32), SAMPLE_RATE)
-        st.session_state.audio_path = wav_path
 
-        with st.spinner(f"Transcribing with {best.capitalize()}..."):
-            result = mm.transcribe_final(wav_path, language)
+def stop_recording():
+    if st.session_state.stop_event:
+        st.session_state.stop_event.set()
+    if st.session_state.audio_thread:
+        st.session_state.audio_thread.join(timeout=5)
+    st.session_state.recording = False
 
-        transcript = (result.get("text") or "").strip()
-        if not transcript:
-            st.error(
-                f"{best.capitalize()} did not detect speech. "
-                "Please check the recording and try again."
-            )
-            return
+    frames   = st.session_state.recorded_frames
+    duration = time.time() - (st.session_state.start_time or time.time())
 
-        st.session_state.final_text = transcript
+    if not frames:
+        st.warning("No audio recorded.")
+        return
 
-        analyzer = SpeechAnalyzer(language)
-        analysis = analyzer.analyze_full(
-            transcript,
-            audio_data,
-            duration,
-            SAMPLE_RATE
-        )
-        st.session_state.analysis_result = analysis
+    audio_data = np.concatenate(frames).astype(np.float32)
+    wav_path   = numpy_to_wav(audio_data, SAMPLE_RATE)
+    st.session_state.audio_path = wav_path
 
-        st.success(f"Analysis completed using {best.capitalize()}.")
+    # Final transcription
+    mm   = st.session_state.model_manager
+    lang = st.session_state.language
+    result     = mm.transcribe_final(wav_path, lang)
+    final_text = result.get("text", "") or st.session_state.live_text
 
-    except Exception as e:
-        logger.exception("Audio processing failed")
-        st.error(f"Could not process the recording: {e}")
+    st.session_state.final_text = final_text
+
+    # Analysis
+    analyzer = SpeechAnalyzer(lang)
+    analysis = analyzer.analyze_full(final_text, audio_data, duration, SAMPLE_RATE)
+    st.session_state.analysis_result = analysis
 
 
 # ===========================================================================
@@ -349,6 +395,7 @@ def render_sidebar():
             st.session_state.language = new_lang
             st.session_state.selected_q_idx = 0
             st.session_state.analysis_result = None
+            st.session_state.live_text = ""
             st.session_state.final_text = ""
             st.rerun()
 
@@ -376,6 +423,7 @@ def render_sidebar():
                 st.session_state.selected_q_idx   = idx
                 st.session_state.current_question = q_list[idx]
                 st.session_state.analysis_result  = None
+                st.session_state.live_text        = ""
             st.caption(f"Q#{st.session_state.selected_q_idx + 1} selected")
 
         st.divider()
@@ -389,16 +437,19 @@ def render_sidebar():
             st.markdown(f"{'✅' if ok else '❌'} **{name.capitalize()}**")
 
         st.divider()
-        st.caption(f"Best model: **{mm.best_model}**")
-        st.caption("The app uses only the selected best model for each recording.")
-        if st.button("▶ Load Best Model", use_container_width=True):
-            with st.spinner(f"Loading {mm.best_model}..."):
-                ok = load_best_model(mm, st.session_state.language)
-            st.success(f"{mm.best_model.capitalize()} loaded.") if ok else st.error(
-                f"{mm.best_model.capitalize()} failed to load. Check app logs."
-            )
+        if st.button("▶ Load Vosk (live)", use_container_width=True):
+            with st.spinner("Downloading / loading Vosk…"):
+                ok = mm.load_vosk(st.session_state.language)
+            st.success("Vosk loaded ✅") if ok else st.error("Vosk failed ❌")
 
-        st.caption("All four ASR models remain available for model comparison.")
+        if st.button("▶ Load Whisper (final)", use_container_width=True):
+            with st.spinner("Loading Whisper-base…"):
+                ok = mm.load_whisper("base")
+            st.success("Whisper loaded ✅") if ok else st.error("Whisper failed ❌")
+
+        st.divider()
+        st.caption(f"Best model: **{mm.best_model}**")
+        st.caption("Run notebook to compare & auto-select best model.")
 
 
 # ===========================================================================
@@ -523,48 +574,52 @@ def render_main():
             unsafe_allow_html=True,
         )
 
-    # Browser recording controls
+    # Controls
+    c1, c2, _ = st.columns([2, 2, 4])
     mm = st.session_state.model_manager
     if mm is None:
-        st.warning("Model Manager is not initialized.")
+        st.warning("⚠️ Click **▶ Load Vosk** in the sidebar first.")
         return
 
-    st.markdown("### 🎙️ Record Your Answer")
-    st.caption(
-        f"Selected transcription model: **{mm.best_model.capitalize()}**. "
-        "Record in your browser, then analyze the audio."
-    )
+    with c1:
+        if not st.session_state.recording:
+            if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
+                start_recording()
+                st.rerun()
+        else:
+            if st.button("⏹️ Stop & Analyze", use_container_width=True):
+                stop_recording()
+                st.rerun()
 
-    audio_file = st.audio_input(
-        "Start recording your interview answer",
-        sample_rate=SAMPLE_RATE,
-        key="answer_audio"
-    )
+    with c2:
+        if st.button("🗑️ Clear", use_container_width=True):
+            for key in ("analysis_result", "live_text", "final_text",
+                        "recorded_frames", "audio_path"):
+                st.session_state[key] = None if key in ("analysis_result", "audio_path") else ([] if key == "recorded_frames" else "")
+            st.rerun()
 
-    if audio_file is not None:
-        st.audio(audio_file, format="audio/wav")
-        if st.button(
-            "Analyze Recording",
-            type="primary",
-            use_container_width=True
-        ):
-            process_recording(audio_file)
-
-    if st.button("🗑️ Clear", use_container_width=True):
-        for key in ("analysis_result", "final_text", "audio_path"):
-            st.session_state[key] = None if key != "final_text" else ""
+    # Recording indicator + live update
+    if st.session_state.recording:
+        elapsed = time.time() - (st.session_state.start_time or time.time())
+        st.markdown(
+            f"<div style='color:#ef4444;font-weight:bold;padding:8px 0;'>"
+            f"🔴 Recording… {elapsed:.0f}s — speak now!</div>",
+            unsafe_allow_html=True,
+        )
+        # Drain live queue
+        q_obj = st.session_state.audio_queue
+        if q_obj:
+            while not q_obj.empty():
+                st.session_state.live_text = q_obj.get_nowait()
+        time.sleep(0.4)
         st.rerun()
 
-    if st.session_state.final_text:
-        st.markdown("### 📝 Final Transcription")
-        st.text_area(
-            "Transcribed answer",
-            st.session_state.final_text,
-            height=120,
-            key="final_transcript_display"
-        )
-
     st.divider()
+
+    # Live transcript panel
+    st.markdown("### 📝 Live Transcription")
+    live_txt = st.session_state.live_text or "_Transcription appears here as you speak…_"
+    st.markdown(f"<div class='live-box'>{live_txt}</div>", unsafe_allow_html=True)
 
     # Results
     if st.session_state.analysis_result:
