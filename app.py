@@ -29,18 +29,25 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Audio library detection
+# OSError is raised when PortAudio system library is missing (e.g. Streamlit Cloud)
+# ImportError is raised when the Python package itself is not installed
 # ---------------------------------------------------------------------------
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    sd = None
     SOUNDDEVICE_AVAILABLE = False
 
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    pyaudio = None
     PYAUDIO_AVAILABLE = False
+
+# Cloud/server environment: no mic → offer WAV file upload fallback
+MIC_AVAILABLE = SOUNDDEVICE_AVAILABLE or PYAUDIO_AVAILABLE
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -229,6 +236,10 @@ def init_session_state():
         "audio_thread": None,
         "audio_queue": None,
         "stop_event": None,
+        # For upload tab: store processed wav bytes so it survives st.rerun()
+        "upload_wav_bytes": None,
+        "upload_filename": None,
+        "whisper_loading": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -333,7 +344,7 @@ def start_recording():
         t = threading.Thread(target=_record_pyaudio,
                              args=(frames, stop_ev, q, lang, mm), daemon=True)
     else:
-        st.error("Install sounddevice or pyaudio: pip install sounddevice")
+        st.error("❌ No microphone library available (PortAudio not found). Use the **📂 Upload WAV** tab instead.")
         return
 
     st.session_state.recorded_frames = frames
@@ -368,6 +379,12 @@ def stop_recording():
     # Final transcription
     mm   = st.session_state.model_manager
     lang = st.session_state.language
+
+    # Auto-load Whisper if not loaded
+    if mm.whisper is None or mm.whisper.model is None:
+        with st.spinner("Loading Whisper for final transcription…"):
+            mm.load_whisper("base")
+
     result     = mm.transcribe_final(wav_path, lang)
     final_text = result.get("text", "") or st.session_state.live_text
 
@@ -436,6 +453,13 @@ def render_sidebar():
         for name, ok in avail.items():
             st.markdown(f"{'✅' if ok else '❌'} **{name.capitalize()}**")
 
+        # Show loaded status
+        st.markdown("**Loaded:**")
+        vosk_loaded = (mm.vosk_en is not None and mm.vosk_en.model is not None) or \
+                      (mm.vosk_id is not None and mm.vosk_id.model is not None)
+        whisper_loaded = mm.whisper is not None and mm.whisper.model is not None
+        st.markdown(f"{'🟢' if vosk_loaded else '🔴'} Vosk  |  {'🟢' if whisper_loaded else '🔴'} Whisper")
+
         st.divider()
         if st.button("▶ Load Vosk (live)", use_container_width=True):
             with st.spinner("Downloading / loading Vosk…"):
@@ -459,9 +483,12 @@ def render_results():
     r    = st.session_state.analysis_result
     lang = st.session_state.language
 
+    if r is None:
+        return
+
     st.markdown("## 📊 Analysis Results")
 
-    # Metrics
+    # Metrics row
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("⏱️ Duration",    f"{r['duration']}s")
     c2.metric("📖 Words",       r['total_words'])
@@ -545,6 +572,46 @@ def render_results():
 # ===========================================================================
 # MAIN
 # ===========================================================================
+def _run_analysis_on_wav(wav_path: str, audio_data: np.ndarray, duration: float):
+    """
+    Transcribe WAV + run full analysis. Populates session_state.
+    audio_data  : already-loaded float32 numpy array at SAMPLE_RATE
+    duration    : audio duration in seconds
+    """
+    mm   = st.session_state.model_manager
+    lang = st.session_state.language
+
+    # 1. Auto-load Whisper if not ready
+    if mm.whisper is None or mm.whisper.model is None:
+        with st.spinner("⏳ Loading Whisper (first time ~30 s)…"):
+            ok = mm.load_whisper("base")
+        if not ok:
+            st.warning("⚠️ Whisper failed to load — will try Vosk fallback for transcript.")
+
+    # 2. Transcribe
+    with st.spinner("🔍 Transcribing audio…"):
+        result     = mm.transcribe_final(wav_path, lang)
+        final_text = result.get("text", "").strip()
+        model_used = result.get("model_used", "none")
+
+    if not final_text:
+        st.warning(
+            f"⚠️ Transcription returned empty text (model used: **{model_used}**).  \n"
+            "Make sure the audio is clear and in the selected language.  \n"
+            "Analysis will still run using audio features only."
+        )
+
+    st.session_state.final_text = final_text
+
+    # 3. Analyse
+    with st.spinner("📊 Analysing speech…"):
+        analyzer = SpeechAnalyzer(lang)
+        analysis = analyzer.analyze_full(final_text, audio_data, duration, SAMPLE_RATE)
+
+    st.session_state.analysis_result = analysis
+    return analysis
+
+
 def render_main():
     lang = st.session_state.language
     mode = st.session_state.session_mode
@@ -574,55 +641,154 @@ def render_main():
             unsafe_allow_html=True,
         )
 
-    # Controls
-    c1, c2, _ = st.columns([2, 2, 4])
-    mm = st.session_state.model_manager
-    if mm is None:
-        st.warning("⚠️ Click **▶ Load Vosk** in the sidebar first.")
-        return
+    # Ensure model manager is set (always available via cache)
+    mm = get_model_manager()
+    st.session_state.model_manager = mm
 
-    with c1:
-        if not st.session_state.recording:
-            if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
-                start_recording()
-                st.rerun()
-        else:
-            if st.button("⏹️ Stop & Analyze", use_container_width=True):
-                stop_recording()
-                st.rerun()
-
-    with c2:
-        if st.button("🗑️ Clear", use_container_width=True):
-            for key in ("analysis_result", "live_text", "final_text",
-                        "recorded_frames", "audio_path"):
-                st.session_state[key] = None if key in ("analysis_result", "audio_path") else ([] if key == "recorded_frames" else "")
-            st.rerun()
-
-    # Recording indicator + live update
-    if st.session_state.recording:
-        elapsed = time.time() - (st.session_state.start_time or time.time())
-        st.markdown(
-            f"<div style='color:#ef4444;font-weight:bold;padding:8px 0;'>"
-            f"🔴 Recording… {elapsed:.0f}s — speak now!</div>",
-            unsafe_allow_html=True,
+    # ── Tab layout: Microphone vs Upload ──────────────────────────────
+    if MIC_AVAILABLE:
+        tab_mic, tab_upload = st.tabs(["🎙️ Microphone", "📂 Upload WAV"])
+    else:
+        st.info(
+            "🖥️ **Server / Cloud environment detected** — microphone not available.  \n"
+            "Upload a WAV recording below to analyze it."
         )
-        # Drain live queue
-        q_obj = st.session_state.audio_queue
-        if q_obj:
-            while not q_obj.empty():
-                st.session_state.live_text = q_obj.get_nowait()
-        time.sleep(0.4)
-        st.rerun()
+        tab_mic    = None
+        tab_upload = st.container()
 
-    st.divider()
+    # ── TAB 1: Microphone ─────────────────────────────────────────────
+    if tab_mic is not None:
+        with tab_mic:
+            c1, c2, _ = st.columns([2, 2, 4])
+            with c1:
+                if not st.session_state.recording:
+                    if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
+                        start_recording()
+                        st.rerun()
+                else:
+                    if st.button("⏹️ Stop & Analyze", use_container_width=True):
+                        stop_recording()
+                        st.rerun()
+            with c2:
+                if st.button("🗑️ Clear", use_container_width=True, key="clear_mic"):
+                    for key in ("analysis_result", "live_text", "final_text", "recorded_frames", "audio_path"):
+                        st.session_state[key] = (
+                            None if key in ("analysis_result", "audio_path")
+                            else [] if key == "recorded_frames"
+                            else ""
+                        )
+                    st.rerun()
 
-    # Live transcript panel
-    st.markdown("### 📝 Live Transcription")
-    live_txt = st.session_state.live_text or "_Transcription appears here as you speak…_"
-    st.markdown(f"<div class='live-box'>{live_txt}</div>", unsafe_allow_html=True)
+            if st.session_state.recording:
+                elapsed = time.time() - (st.session_state.start_time or time.time())
+                st.markdown(
+                    f"<div style='color:#ef4444;font-weight:bold;padding:8px 0;'>"
+                    f"🔴 Recording… {elapsed:.0f}s — speak now!</div>",
+                    unsafe_allow_html=True,
+                )
+                q_obj = st.session_state.audio_queue
+                if q_obj:
+                    while not q_obj.empty():
+                        st.session_state.live_text = q_obj.get_nowait()
+                time.sleep(0.4)
+                st.rerun()
 
-    # Results
-    if st.session_state.analysis_result:
+            st.divider()
+            st.markdown("### 📝 Live Transcription")
+            live_txt = st.session_state.live_text or "_Transcription appears here as you speak…_"
+            st.markdown(f"<div class='live-box'>{live_txt}</div>", unsafe_allow_html=True)
+
+    # ── TAB 2: Upload WAV ─────────────────────────────────────────────
+    with tab_upload:
+        st.markdown("### 📂 Upload a WAV / Audio File")
+        st.caption("Record yourself locally (Voice Memos, Audacity, etc.) then upload here.")
+
+        uploaded = st.file_uploader(
+            "Choose audio file",
+            type=["wav", "mp3", "ogg", "flac", "m4a"],
+            key="wav_uploader",
+        )
+
+        # When a new file is uploaded, cache the bytes into session_state
+        if uploaded is not None:
+            file_bytes = uploaded.read()
+            # Only update if it's a new file (different name or new session)
+            if (st.session_state.upload_filename != uploaded.name or
+                    st.session_state.upload_wav_bytes is None):
+                st.session_state.upload_wav_bytes = file_bytes
+                st.session_state.upload_filename  = uploaded.name
+                # Clear previous results when new file is selected
+                st.session_state.analysis_result  = None
+                st.session_state.final_text        = ""
+
+        col_a, col_b = st.columns([2, 6])
+        with col_a:
+            analyze_btn = st.button(
+                "🔍 Analyze Upload",
+                use_container_width=True,
+                type="primary",
+                disabled=(st.session_state.upload_wav_bytes is None),
+            )
+        with col_b:
+            if st.button("🗑️ Clear", use_container_width=True, key="clear_upload"):
+                st.session_state.analysis_result  = None
+                st.session_state.live_text         = ""
+                st.session_state.final_text        = ""
+                st.session_state.upload_wav_bytes  = None
+                st.session_state.upload_filename   = None
+                st.session_state.audio_path        = None
+                st.rerun()
+
+        if analyze_btn and st.session_state.upload_wav_bytes:
+            suffix = "." + (st.session_state.upload_filename or "audio.wav").rsplit(".", 1)[-1]
+            try:
+                # Write cached bytes to temp file
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(st.session_state.upload_wav_bytes)
+                    raw_path = tmp.name
+
+                # Load audio with librosa → 16 kHz mono float32
+                try:
+                    import librosa as _librosa
+                    audio_data, _ = _librosa.load(raw_path, sr=SAMPLE_RATE, mono=True)
+                except Exception as lib_err:
+                    # Fallback: try soundfile
+                    try:
+                        import soundfile as _sf
+                        audio_data, orig_sr = _sf.read(raw_path, dtype="float32", always_2d=False)
+                        if audio_data.ndim > 1:
+                            audio_data = audio_data.mean(axis=1)
+                        if orig_sr != SAMPLE_RATE:
+                            # Simple linear resample
+                            from scipy.signal import resample
+                            target_len = int(len(audio_data) * SAMPLE_RATE / orig_sr)
+                            audio_data = resample(audio_data, target_len).astype(np.float32)
+                    except Exception as sf_err:
+                        st.error(
+                            f"❌ Could not load audio file.\n"
+                            f"librosa error: {lib_err}\n"
+                            f"soundfile error: {sf_err}"
+                        )
+                        raise
+
+                duration = len(audio_data) / SAMPLE_RATE
+                wav_path = numpy_to_wav(audio_data, SAMPLE_RATE)
+                st.session_state.audio_path = wav_path
+
+                # Run transcription + analysis
+                _run_analysis_on_wav(wav_path, audio_data, duration)
+
+            except Exception as e:
+                st.error(f"❌ Error processing audio: {e}")
+                import traceback
+                st.code(traceback.format_exc(), language="text")
+
+        # Play audio preview (use cached bytes if available)
+        if st.session_state.upload_wav_bytes is not None:
+            st.audio(st.session_state.upload_wav_bytes, format="audio/wav")
+
+    # ── Results (shared by both tabs) ─────────────────────────────────
+    if st.session_state.analysis_result is not None:
         st.divider()
         render_results()
 
