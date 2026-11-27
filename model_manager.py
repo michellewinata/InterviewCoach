@@ -78,13 +78,15 @@ def numpy_to_wav(audio: np.ndarray, sample_rate: int = 16000) -> str:
 class VoskTranscriber:
     """Real-time speech recognition using Vosk."""
 
+    # Small models (40–60 MB) suitable for Streamlit Cloud deployment.
+    # Swap to larger models after running the comparison notebook locally.
     MODEL_URLS = {
-        "en": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
-        "id": "https://alphacephei.com/vosk/models/vosk-model-id-0.21.zip",
+        "en": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+        "id": "https://alphacephei.com/vosk/models/vosk-model-small-id-0.22.zip",
     }
     MODEL_DIRS = {
-        "en": "models/vosk-model-en-us-0.22",
-        "id": "models/vosk-model-id-0.21",
+        "en": "models/vosk-model-small-en-us-0.15",
+        "id": "models/vosk-model-small-id-0.22",
     }
 
     def __init__(self, language: str = "en"):
