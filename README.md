@@ -1,3 +1,0 @@
-# InterviewCoach
-
-- proyek Speech recognition
