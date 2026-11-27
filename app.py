@@ -33,13 +33,13 @@ logger = logging.getLogger(__name__)
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     SOUNDDEVICE_AVAILABLE = False
 
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     PYAUDIO_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
