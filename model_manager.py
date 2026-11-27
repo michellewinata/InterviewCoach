@@ -29,18 +29,10 @@ except ImportError:
     VOSK_AVAILABLE = False
 
 try:
-    from faster_whisper import WhisperModel as FasterWhisperModel
-    FASTER_WHISPER_AVAILABLE = True
-except ImportError:
-    FASTER_WHISPER_AVAILABLE = False
-
-try:
     import whisper as openai_whisper
-    OPENAI_WHISPER_AVAILABLE = True
+    WHISPER_AVAILABLE = True
 except ImportError:
-    OPENAI_WHISPER_AVAILABLE = False
-
-WHISPER_AVAILABLE = FASTER_WHISPER_AVAILABLE or OPENAI_WHISPER_AVAILABLE
+    WHISPER_AVAILABLE = False
 
 try:
     from transformers import pipeline as hf_pipeline, Wav2Vec2ForCTC, Wav2Vec2Processor
@@ -87,11 +79,11 @@ class VoskTranscriber:
     """Real-time speech recognition using Vosk."""
 
     MODEL_URLS = {
-        "en": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+        "en": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
         "id": "https://alphacephei.com/vosk/models/vosk-model-id-0.21.zip",
     }
     MODEL_DIRS = {
-        "en": "models/vosk-model-small-en-us-0.15",
+        "en": "models/vosk-model-en-us-0.22",
         "id": "models/vosk-model-id-0.21",
     }
 
@@ -179,58 +171,45 @@ class VoskTranscriber:
 # Model 2 – Whisper  (accurate, offline, best for final transcript)
 # ===========================================================================
 class WhisperTranscriber:
-    """High-accuracy ASR using Whisper.
-
-    Uses faster-whisper (CTranslate2, int8, no PyTorch) when installed,
-    otherwise falls back to openai-whisper.
-    """
+    """High-accuracy ASR using OpenAI Whisper (local)."""
 
     def __init__(self, model_size: str = "base"):
         self.model_size = model_size
         self.model = None
-        self.backend: Optional[str] = None
 
     def load(self, model_size: Optional[str] = None) -> bool:
         if not WHISPER_AVAILABLE:
             return False
-        size = model_size or self.model_size
         try:
-            if FASTER_WHISPER_AVAILABLE:
-                self.model = FasterWhisperModel(size, device="cpu", compute_type="int8")
-                self.backend = "faster"
-            else:
-                self.model = openai_whisper.load_model(size)
-                self.backend = "openai"
+            size = model_size or self.model_size
+            self.model = openai_whisper.load_model(size)
             return True
         except Exception as e:
             logger.error(f"Whisper load error: {e}")
             return False
 
     def transcribe(self, wav_path: str, language: Optional[str] = None) -> Dict:
-        """Returns dict with keys: text, segments, language.
+        """
+        Returns dict with keys: text, segments, language.
         segments: list of {start, end, text}
         """
-        empty = {"text": "", "segments": [], "language": language or "en"}
         if self.model is None:
-            return empty
-        lang = language if language in ("en", "id") else None
+            return {"text": "", "segments": [], "language": language or "en"}
         try:
-            if self.backend == "faster":
-                segs, info = self.model.transcribe(wav_path, language=lang, beam_size=1)
-                segments = [{"start": g.start, "end": g.end, "text": g.text} for g in segs]
-                text = " ".join(g["text"].strip() for g in segments).strip()
-                return {"text": text, "segments": segments,
-                        "language": getattr(info, "language", lang or "en")}
-            opts = {"language": lang} if lang else {}
+            opts = {}
+            if language == "id":
+                opts["language"] = "id"
+            elif language == "en":
+                opts["language"] = "en"
             result = self.model.transcribe(wav_path, **opts)
             return {
                 "text": result.get("text", "").strip(),
                 "segments": result.get("segments", []),
-                "language": result.get("language", lang or "en"),
+                "language": result.get("language", language or "en"),
             }
         except Exception as e:
             logger.error(f"Whisper transcribe error: {e}")
-            return empty
+            return {"text": "", "segments": [], "language": language or "en"}
 
 
 # ===========================================================================
