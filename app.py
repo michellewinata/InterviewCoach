@@ -612,6 +612,52 @@ def _run_analysis_on_wav(wav_path: str, audio_data: np.ndarray, duration: float)
     return analysis
 
 
+def _process_audio_bytes(file_bytes: bytes, filename: str = "audio.wav"):
+    """Decode raw audio bytes to 16 kHz mono WAV and run transcription + analysis."""
+    suffix = "." + (filename or "audio.wav").rsplit(".", 1)[-1]
+    raw_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            raw_path = tmp.name
+
+        try:
+            import librosa as _librosa
+            audio_data, _ = _librosa.load(raw_path, sr=SAMPLE_RATE, mono=True)
+        except Exception as lib_err:
+            try:
+                import soundfile as _sf
+                audio_data, orig_sr = _sf.read(raw_path, dtype="float32", always_2d=False)
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
+                if orig_sr != SAMPLE_RATE:
+                    from scipy.signal import resample
+                    target_len = int(len(audio_data) * SAMPLE_RATE / orig_sr)
+                    audio_data = resample(audio_data, target_len).astype(np.float32)
+            except Exception as sf_err:
+                st.error(
+                    f"❌ Could not load audio file.\n"
+                    f"librosa error: {lib_err}\n"
+                    f"soundfile error: {sf_err}"
+                )
+                return
+
+        duration = len(audio_data) / SAMPLE_RATE
+        wav_path = numpy_to_wav(audio_data, SAMPLE_RATE)
+        st.session_state.audio_path = wav_path
+        _run_analysis_on_wav(wav_path, audio_data, duration)
+    except Exception as e:
+        st.error(f"❌ Error processing audio: {e}")
+        import traceback
+        st.code(traceback.format_exc(), language="text")
+    finally:
+        if raw_path and os.path.exists(raw_path):
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+
+
 def render_main():
     lang = st.session_state.language
     mode = st.session_state.session_mode
@@ -645,18 +691,25 @@ def render_main():
     mm = get_model_manager()
     st.session_state.model_manager = mm
 
-    # ── Tab layout: Microphone vs Upload ──────────────────────────────
+    # ── Tab layout: Local Mic vs Browser Mic vs Upload ────────────────
+    HAS_BROWSER_MIC = hasattr(st, "audio_input")
+
     if MIC_AVAILABLE:
         tab_mic, tab_upload = st.tabs(["🎙️ Microphone", "📂 Upload WAV"])
+        tab_browser_mic = None
+    elif HAS_BROWSER_MIC:
+        tab_browser_mic, tab_upload = st.tabs(["🎙️ Browser Microphone", "📂 Upload WAV"])
+        tab_mic = None
     else:
         st.info(
             "🖥️ **Server / Cloud environment detected** — microphone not available.  \n"
             "Upload a WAV recording below to analyze it."
         )
-        tab_mic    = None
+        tab_mic = None
+        tab_browser_mic = None
         tab_upload = st.container()
 
-    # ── TAB 1: Microphone ─────────────────────────────────────────────
+    # ── TAB 1A: Local Microphone (sounddevice / pyaudio) ──────────────
     if tab_mic is not None:
         with tab_mic:
             c1, c2, _ = st.columns([2, 2, 4])
@@ -697,6 +750,19 @@ def render_main():
             st.markdown("### 📝 Live Transcription")
             live_txt = st.session_state.live_text or "_Transcription appears here as you speak…_"
             st.markdown(f"<div class='live-box'>{live_txt}</div>", unsafe_allow_html=True)
+
+    # ── TAB 1B: Browser Microphone (Streamlit Cloud / Web) ────────────
+    if tab_browser_mic is not None:
+        with tab_browser_mic:
+            st.markdown("### 🎙️ Record Directly in Browser")
+            st.caption("Click the microphone icon below to start recording, click stop when finished, then click **Analyze Recording**.")
+
+            browser_audio = st.audio_input("Record your answer", key="browser_mic_input")
+
+            if browser_audio is not None:
+                b_bytes = browser_audio.getvalue()
+                if st.button("🔍 Analyze Recording", use_container_width=True, type="primary", key="analyze_browser_mic"):
+                    _process_audio_bytes(b_bytes, "browser_recording.wav")
 
     # ── TAB 2: Upload WAV ─────────────────────────────────────────────
     with tab_upload:
@@ -740,48 +806,10 @@ def render_main():
                 st.rerun()
 
         if analyze_btn and st.session_state.upload_wav_bytes:
-            suffix = "." + (st.session_state.upload_filename or "audio.wav").rsplit(".", 1)[-1]
-            try:
-                # Write cached bytes to temp file
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(st.session_state.upload_wav_bytes)
-                    raw_path = tmp.name
-
-                # Load audio with librosa → 16 kHz mono float32
-                try:
-                    import librosa as _librosa
-                    audio_data, _ = _librosa.load(raw_path, sr=SAMPLE_RATE, mono=True)
-                except Exception as lib_err:
-                    # Fallback: try soundfile
-                    try:
-                        import soundfile as _sf
-                        audio_data, orig_sr = _sf.read(raw_path, dtype="float32", always_2d=False)
-                        if audio_data.ndim > 1:
-                            audio_data = audio_data.mean(axis=1)
-                        if orig_sr != SAMPLE_RATE:
-                            # Simple linear resample
-                            from scipy.signal import resample
-                            target_len = int(len(audio_data) * SAMPLE_RATE / orig_sr)
-                            audio_data = resample(audio_data, target_len).astype(np.float32)
-                    except Exception as sf_err:
-                        st.error(
-                            f"❌ Could not load audio file.\n"
-                            f"librosa error: {lib_err}\n"
-                            f"soundfile error: {sf_err}"
-                        )
-                        raise
-
-                duration = len(audio_data) / SAMPLE_RATE
-                wav_path = numpy_to_wav(audio_data, SAMPLE_RATE)
-                st.session_state.audio_path = wav_path
-
-                # Run transcription + analysis
-                _run_analysis_on_wav(wav_path, audio_data, duration)
-
-            except Exception as e:
-                st.error(f"❌ Error processing audio: {e}")
-                import traceback
-                st.code(traceback.format_exc(), language="text")
+            _process_audio_bytes(
+                st.session_state.upload_wav_bytes,
+                st.session_state.upload_filename or "audio.wav",
+            )
 
         # Play audio preview (use cached bytes if available)
         if st.session_state.upload_wav_bytes is not None:
