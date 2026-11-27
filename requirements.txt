@@ -1,10 +1,38 @@
-# InterviewCoach - runtime requirements (Streamlit Cloud friendly)
-# Use Python 3.11 or 3.12 (set in Streamlit Cloud -> Advanced settings)
+# InterviewCoach - Requirements
+# Install: pip install -r requirements.txt
 
-streamlit>=1.40.0
-numpy>=1.24.0
-scipy>=1.10.0
+# ── Core ──────────────────────────────────────
+streamlit>=1.20.0
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.5.0
 
-# ASR
-faster-whisper>=1.0.0   # Whisper without PyTorch (EN + ID), used for the final transcript
-vosk>=0.3.45            # optional lightweight English fallback
+# ── ASR Models ────────────────────────────────
+vosk>=0.3.45
+openai-whisper>=20230918
+transformers>=4.30.0
+torch>=2.0.0
+torchaudio>=2.0.0
+speechbrain>=0.5.15
+
+# ── Audio I/O ─────────────────────────────────
+sounddevice>=0.4.6
+# PyAudio: on Windows use: pip install pipwin && pipwin install pyaudio
+# PyAudio>=0.2.13
+soundfile>=0.12.1
+librosa>=0.10.0
+
+# ── Notebook / Training ───────────────────────
+datasets>=2.14.0
+huggingface_hub>=0.16.0
+jiwer>=3.0.3
+evaluate>=0.4.0
+accelerate>=0.20.0
+
+# ── Visualization ─────────────────────────────
+matplotlib>=3.5.0
+seaborn>=0.12.0
+
+# ── Utilities ─────────────────────────────────
+tqdm>=4.65.0
+kaggle>=1.5.16
