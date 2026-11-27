@@ -33,15 +33,13 @@ logger = logging.getLogger(__name__)
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except (ImportError, OSError):
-    sd = None
+except ImportError:
     SOUNDDEVICE_AVAILABLE = False
 
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
-except (ImportError, OSError):
-    pyaudio = None
+except ImportError:
     PYAUDIO_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -399,7 +397,7 @@ def render_sidebar():
             st.session_state.analysis_result = None
             st.session_state.live_text = ""
             st.session_state.final_text = ""
-            st.experimental_rerun()
+            st.rerun()
 
         st.divider()
 
@@ -587,18 +585,18 @@ def render_main():
         if not st.session_state.recording:
             if st.button("🔴 Start Recording", use_container_width=True, type="primary"):
                 start_recording()
-                st.experimental_rerun()
+                st.rerun()
         else:
             if st.button("⏹️ Stop & Analyze", use_container_width=True):
                 stop_recording()
-                st.experimental_rerun()
+                st.rerun()
 
     with c2:
         if st.button("🗑️ Clear", use_container_width=True):
             for key in ("analysis_result", "live_text", "final_text",
                         "recorded_frames", "audio_path"):
                 st.session_state[key] = None if key in ("analysis_result", "audio_path") else ([] if key == "recorded_frames" else "")
-            st.experimental_rerun()
+            st.rerun()
 
     # Recording indicator + live update
     if st.session_state.recording:
@@ -614,7 +612,7 @@ def render_main():
             while not q_obj.empty():
                 st.session_state.live_text = q_obj.get_nowait()
         time.sleep(0.4)
-        st.experimental_rerun()
+        st.rerun()
 
     st.divider()
 
